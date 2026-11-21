@@ -109,8 +109,9 @@ def get_builtin_tools() -> list[Tool]:
         Tool(
             name="edit_file",
             description=(
-                "Make line-based edits to a text file. Each edit replaces exact line sequences "
-                "with new content. Returns a git-style diff showing the changes made."
+                "Replace one exact match in a text file and show the change. "
+                "If the text occurs more than once, use more surrounding text or "
+                "narrow the search to an inclusive line range."
             ),
             parameters=object_schema(
                 {
@@ -122,6 +123,16 @@ def get_builtin_tools() -> list[Tool]:
                     "new_text": {
                         "type": "string",
                         "description": "Text to replace with",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "First searchable line, 1-based; default is the first line",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Last searchable line, inclusive; default is the last line",
                     },
                     "dry_run": {
                         "type": "boolean",
@@ -446,13 +457,23 @@ async def _write_file(payload: dict[str, Any], context: ToolContext) -> ToolResu
 
 
 async def _edit_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
+    path, old_text, new_text = payload["path"], payload["old_text"], payload["new_text"]
+    if not all(isinstance(value, str) for value in (path, old_text, new_text)):
+        return ToolResult("edit_file requires strings for path, old_text and new_text.", is_error=True)
+    dry_run = payload.get("dry_run", False)
+    if not isinstance(dry_run, bool):
+        return ToolResult("edit_file requires a boolean for dry_run.", is_error=True)
+    if any(key in payload and type(payload[key]) is not int for key in ("start_line", "end_line")):
+        return ToolResult("edit_file requires integer line bounds.", is_error=True)
     result: FileOpResult = fops.edit_file(
         context.cwd,
-        str(payload["path"]),
-        str(payload["old_text"]),
-        str(payload["new_text"]),
+        path,
+        old_text,
+        new_text,
         path_guard_enabled=context.config.policy.path_guard_enabled,
-        dry_run=bool(payload.get("dry_run")),
+        dry_run=dry_run,
+        start_line=payload.get("start_line"),
+        end_line=payload.get("end_line"),
     )
     return _to_tool_result(result)
 

@@ -9,7 +9,7 @@ from typing import Any
 
 from paicli.harness.contracts import active_policy
 from paicli.harness.evidence import current_run, evidence_context
-from paicli.harness.execution import active_control
+from paicli.harness.execution import RunStopped, active_control
 from paicli.policy import AuditLog
 from paicli.tools.base import Tool, ToolContext, ToolDecision, ToolResult
 from paicli.tools.registry import ToolRegistry
@@ -139,7 +139,7 @@ class ToolExecutor:
                     "Malformed JSON arguments: resubmit concise valid JSON, not a raw string"
                 )
             data = tool.validate(payload)
-            decision = await self._approval_decision(tool, data, context)
+            decision = await self.approval_decision(tool, data, context)
             if decision in {"deny", "skip"}:
                 approver = "hitl"
                 audit.record(
@@ -168,6 +168,8 @@ class ToolExecutor:
                     cwd=context.cwd,
                 )
             return result
+        except RunStopped:
+            raise
         except Exception as exc:  # noqa: BLE001 - 工具错误需要反馈给模型继续判断。
             if context.config.features.audit_log and tool and not tool.is_read_only:
                 audit.record(
@@ -183,8 +185,8 @@ class ToolExecutor:
                 is_error=True,
             )
 
-    async def _approval_decision(
-        self,
+    @staticmethod
+    async def approval_decision(
         tool: Tool,
         payload: dict[str, Any],
         context: ToolContext,

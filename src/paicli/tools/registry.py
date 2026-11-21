@@ -28,6 +28,12 @@ class ToolRegistry:
         """导出当前可见工具的参数说明，交给模型生成结构化调用请求。"""
         return [self._tools[name].definition() for name in self.list_names()]
 
+    def copy(self) -> ToolRegistry:
+        """新建会话的工具注册表，沿用基础工具实现。"""
+        registry = ToolRegistry()
+        registry.register_all(list(self._tools.values()))
+        return registry
+
     def read_only(self) -> ToolRegistry:
         """同时收窄模型可见工具和实际查找范围，供并行只读任务使用。"""
         registry = ToolRegistry()

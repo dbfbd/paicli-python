@@ -97,6 +97,7 @@ class WorkflowRunner:
         reviewer: Reviewer | None = None,
         max_concurrency: int = 2,
         max_retries: int = 0,
+        prior_results: dict[str, TaskOutcome] | None = None,
     ):
         validate_plan_nodes(
             {"tasks": [{"id": task.id, "dependencies": task.dependencies} for task in tasks]},
@@ -110,6 +111,9 @@ class WorkflowRunner:
         self.reviewer = reviewer
         self.max_concurrency = max(1, max_concurrency)
         self.max_retries = max(0, max_retries)
+        self._prior_results = dict(prior_results or {})
+        if set(self._prior_results) - by_id.keys():
+            raise ValueError("Prior results must belong to tasks in the current plan")
         self.results: dict[str, TaskOutcome] = {}
         self.task_graph = self._build_task_graph()
 
@@ -132,17 +136,17 @@ class WorkflowRunner:
     @property
     def status(self) -> str:
         statuses = {result.status for result in self.results.values()}
-        for status in ("budget_exhausted", "failed", "blocked"):
+        for status in ("replan_required", "budget_exhausted", "failed", "blocked"):
             if status in statuses:
                 return status
         return "completed" if len(self.results) == len(self.tasks) else "failed"
 
     async def run(self) -> AsyncIterator[dict[str, Any]]:
         """运行任务图并持续转发事件，只从所属图命名空间更新最终结果。"""
-        self.results = {}
+        self.results = dict(self._prior_results)
         root_namespace = None
         async for namespace, mode, data in self.graph.astream(
-            {"results": {}},
+            {"results": self.results},
             config={"recursion_limit": 2 * len(self.tasks) + 4},
             stream_mode=["custom", "values"],
             subgraphs=True,
@@ -159,6 +163,8 @@ class WorkflowRunner:
     def _dispatch(self, state: WorkflowState) -> dict:
         """将依赖已失败的下游任务标为 blocked，防止继续执行失去前提的任务。"""
         results = dict(state["results"])
+        if any(result.status == "replan_required" for result in results.values()):
+            return {}
         blocked = {}
         for task in self.tasks:
             if task.id in results:
@@ -178,6 +184,8 @@ class WorkflowRunner:
     def _route(self, state: WorkflowState) -> list[Send] | str:
         """选择依赖已齐备的任务；只读任务按并发上限分发，修改任务独占一个批次。"""
         results = state["results"]
+        if any(result.status == "replan_required" for result in results.values()):
+            return END
         ready = [
             task
             for task in self.tasks
@@ -263,7 +271,7 @@ class WorkflowRunner:
                     result.evidence = run.save_text("task-result", result.text)
         except Exception as exc:  # noqa: BLE001 - 将异常转换为明确任务终态。
             result = WorkerResult("", status="failed", error=str(exc))
-        if result.status not in {"completed", "failed", "budget_exhausted"}:
+        if result.status not in {"completed", "failed", "budget_exhausted", "replan_required"}:
             result = WorkerResult(
                 result.text, result.usage, result.turns, "failed", "invalid worker status"
             )

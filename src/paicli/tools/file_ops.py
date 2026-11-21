@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import glob as glob_module
+import os
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -150,6 +152,10 @@ def write_file(
 # ---------------------------------------------------------------------------
 
 
+_LINE_ENDING = re.compile(r"\r\n|\r|\n")
+_EDIT_PREVIEW_MATCHES = 5
+
+
 def edit_file(
     cwd: str,
     path: str,
@@ -158,44 +164,90 @@ def edit_file(
     *,
     path_guard_enabled: bool = True,
     dry_run: bool = False,
+    start_line: int | None = None,
+    end_line: int | None = None,
 ) -> FileOpResult:
-    """在原始文本中精确替换首个匹配片段；dry_run 只生成差异，不写文件。"""
+    """精确替换指定行范围内的唯一匹配；预览和歧义错误均不写文件。"""
     resolved = resolve_path(cwd, path, path_guard_enabled)
     if not resolved.is_file():
         return FileOpResult(f"Not a file: {resolved}", is_error=True)
 
     try:
-        original = resolved.read_text(encoding="utf-8")
-    except OSError as exc:
+        with resolved.open("r", encoding="utf-8", newline="") as stream:
+            original = stream.read()
+    except (OSError, UnicodeError) as exc:
         return FileOpResult(f"Failed to read {resolved}: {exc}", is_error=True)
 
-    if old_text not in original:
+    needle = _LINE_ENDING.sub("\n", old_text)
+    if not needle:
         return FileOpResult(
-            "edit_file failed: `old_text` not found in the file. "
-            "Provide the exact existing text to replace.",
+            "edit_file failed: `old_text` is empty. Provide existing text around the edit.",
+            is_error=True,
+        )
+    rel = _relative_to(resolved, cwd)
+    # 匹配时统一换行，写回时依据行首位置找到原文中的实际偏移。
+    canonical = _LINE_ENDING.sub("\n", original)
+    raw_starts = [0, *(ending.end() for ending in _LINE_ENDING.finditer(original))]
+    line_starts = [0, *(index + 1 for index, char in enumerate(canonical) if char == "\n")]
+    line_count = len(line_starts) - canonical.endswith("\n")
+    first = 1 if start_line is None else start_line
+    last = line_count if end_line is None else end_line
+    if type(first) is not int or type(last) is not int or not 1 <= first <= last <= line_count:
+        return FileOpResult(
+            f"edit_file failed: invalid line range for {rel} ({line_count} lines). "
+            "Use 1-based inclusive start_line and end_line within the file.",
             is_error=True,
         )
 
-    new_content = original.replace(old_text, new_text, 1)
+    lower = line_starts[first - 1]
+    upper = line_starts[last] if last < len(line_starts) else len(canonical)
+    matches: list[int] = []
+    position = canonical.find(needle, lower, upper)
+    while position != -1 and len(matches) <= _EDIT_PREVIEW_MATCHES:
+        matches.append(position)
+        position = canonical.find(needle, position + 1, upper)
+    if not matches:
+        return FileOpResult(
+            f"edit_file failed: `old_text` not found in {rel} at lines {first}-{last}. "
+            "Re-read the file, then use the current exact text and check the line range.",
+            is_error=True,
+        )
+    if len(matches) > 1:
+        details = _edit_candidates(canonical, line_starts, matches, len(needle))
+        return FileOpResult(
+            f"edit_file failed: `old_text` matches multiple locations in {rel}.\n"
+            f"{details}\nUse more surrounding text or narrow start_line and end_line.",
+            is_error=True,
+        )
+
+    start = matches[0]
+    end = start + len(needle)
+    start_index = bisect_right(line_starts, start) - 1
+    end_index = bisect_right(line_starts, end) - 1
+    raw_start = raw_starts[start_index] + start - line_starts[start_index]
+    raw_end = raw_starts[end_index] + end - line_starts[end_index]
+    replacement = _edit_line_endings(new_text, original, raw_start, raw_end)
+    new_content = original[:raw_start] + replacement + original[raw_end:]
     if new_content == original:
         return FileOpResult("edit_file: no changes made (old_text == new_text).")
 
     # 生成紧凑的修改概览。
     diff_lines = _build_diff_summary(old_text, new_text)
+    last_match_line = bisect_right(line_starts, end - 1)
+    region = f"Lines {start_index + 1}-{last_match_line}"
 
     if dry_run:
         return FileOpResult(
-            f"[DRY RUN] Would edit {_relative_to(resolved, cwd)}\n" + diff_lines,
-            display_summary=f"Dry-run edit {_relative_to(resolved, cwd)}",
+            f"[DRY RUN] Would edit {rel}\n{region}\n{diff_lines}",
+            display_summary=f"Dry-run edit {rel}",
         )
 
     try:
-        with resolved.open("w", encoding="utf-8") as handle:
+        with resolved.open("w", encoding="utf-8", newline="") as handle:
             handle.write(new_content)
     except OSError as exc:
         return FileOpResult(f"Failed to write {resolved}: {exc}", is_error=True)
 
-    rel = _relative_to(resolved, cwd)
     suffix = ""
     if resolved.suffix == ".py":
         diagnostics = diagnose_file(resolved)
@@ -203,9 +255,55 @@ def edit_file(
             suffix = "\n\nDiagnostics:\n" + "\n".join(diagnostics)
 
     return FileOpResult(
-        f"Edited {rel}\n" + diff_lines + suffix,
+        f"Edited {rel}\n{region}\n{diff_lines}{suffix}",
         display_summary=f"Edited {rel}",
     )
+
+
+def _edit_candidates(
+    content: str, starts: list[int], matches: list[int], length: int
+) -> str:
+    snippets = []
+    line_count = len(starts) - content.endswith("\n")
+    for offset in matches[:_EDIT_PREVIEW_MATCHES]:
+        line = bisect_right(starts, offset)
+        column = offset - starts[line - 1] + 1
+        last = bisect_right(starts, offset + length - 1)
+        nearby = [f"- Lines {line}-{last}, column {column}"]
+        for number in range(max(1, line - 1), min(line + 1, line_count) + 1):
+            start = starts[number - 1]
+            end = starts[number] if number < len(starts) else len(content)
+            left = max(start, offset - 50) if number == line else start
+            excerpt = content[left : min(left + 140, end)].rstrip("\n")
+            nearby.append(f"  {number}: {'…' if left > start else ''}{excerpt}")
+        snippets.append("\n".join(nearby))
+    if len(matches) > _EDIT_PREVIEW_MATCHES:
+        snippets.append("Additional matches omitted.")
+    return "\n".join(snippets)
+
+
+def _edit_line_endings(new_text: str, original: str, start: int, end: int) -> str:
+    endings = iter(match.group() for match in _LINE_ENDING.finditer(original, start, end))
+    nearby = _LINE_ENDING.search(original, end) or _LINE_ENDING.search(original)
+    fallback = nearby.group() if nearby else os.linesep
+    # 混合换行下，独立的 CR 和 LF 接在一起时仍应代表两次换行。
+    first, *lines = _LINE_ENDING.split(new_text)
+    parts = [first]
+    for line in lines:
+        ending = next(endings, fallback)
+        if ending == "\n" and parts[-1].endswith("\r"):
+            ending = "\r\n"
+        parts.append(ending + line)
+    replacement = "".join(parts)
+    suffix_has_lf = original.startswith("\n", end)
+    if start and original[start - 1] == "\r":
+        if replacement.startswith("\n"):
+            replacement = "\r" + replacement
+        elif not replacement and suffix_has_lf:
+            replacement = "\n"
+    if replacement.endswith("\r") and suffix_has_lf:
+        replacement += "\n"
+    return replacement
 
 
 def _build_diff_summary(old_text: str, new_text: str) -> str:

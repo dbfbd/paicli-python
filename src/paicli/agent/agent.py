@@ -1,21 +1,23 @@
 """终端 Agent 的会话入口。
 
-维护消息历史和单次执行统计，按 react、plan、team 模式转交执行，
+维护消息历史和单次执行统计，普通输入在同一循环里按需委派，
 通过统一事件协议向命令行、交互终端和 SDK 返回进度。
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
-from contextlib import suppress
+from contextlib import aclosing, suppress
 from typing import Any, Literal
 
-from paicli.agent.orchestrator import AgentOrchestrator
+from paicli.agent.collaboration import Collaboration, LEAD_INSTRUCTIONS
 from paicli.agent.plan_execute import PlanExecuteAgent
 from paicli.agent.query import query as _query
+from paicli.agent.specialized import SpecializedWorkflows
 from paicli.config import PaiCliConfig
 from paicli.harness.evidence import recorded_run
 from paicli.llm.base import LlmClient
+from paicli.llm.pricing import calculate_costs
 from paicli.prompt import PromptAssembler
 from paicli.skill import SkillContextBuffer
 from paicli.snapshot import SnapshotService
@@ -28,7 +30,8 @@ AgentMode = Literal["react", "plan", "team"]
 class Agent:
     """维护一个 Agent 会话，并连接模型、工具与运行配置。
 
-    普通模式复用 query 循环；Plan 和 Team 分别交给各自的编排器。
+    普通输入复用 query 循环，由主 Agent 自行处理或委派。显式 Plan 和 Team
+    入口供原来使用这些运行方式的调用方继续使用。
     对象保留历史，调用方可复用实例继续对话。
     """
 
@@ -99,8 +102,9 @@ class Agent:
             snapshot.create("pre-turn")
 
         try:
-            async for event in self._run_react(message):
-                yield event
+            async with aclosing(self._run_react(message)) as stream:
+                async for event in stream:
+                    yield event
         finally:
             with suppress(Exception):
                 snapshot.create("post-turn")
@@ -153,24 +157,45 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def _run_react(self, message: str) -> AsyncIterator[dict[str, Any]]:
-        """运行共享的模型与工具循环，并从最终事件保存会话历史和用量。"""
-        async for event in _query(
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry,
-            system_prompt=self.system_prompt,
-            user_message=message,
-            history=self.history,
-            cwd=self.cwd,
-            config=self.config,
-            approval_callback=self.approval_callback,
-            skill_context_buffer=self.skill_context_buffer,
-            max_turns=self.max_turns,
-        ):
-            if event.get("type") == "done":
-                self.history = list(event.get("messages") or [])
-                self.last_usage = Usage.from_mapping(event.get("usage") or {})
-                self.last_cost = dict(event.get("cost") or {})
-            yield event
+        """同一会话负责用户任务，并在有委派时把 Worker 用量并入最终事件。"""
+        collaboration = Collaboration(
+            llm_client=self.llm_client, registry=self.tool_registry,
+            config=self.config, cwd=self.cwd, approval_callback=self.approval_callback,
+        )
+        workflows = SpecializedWorkflows(self.llm_client, collaboration)
+        routing = workflows.routing_context(message, self.cwd)
+        registry = collaboration.registry()
+        workflows.register(registry, auto_plan=self.config.plan.auto_route)
+        stream = _query(
+            llm_client=self.llm_client, tool_registry=registry,
+            system_prompt=f"{self.system_prompt}\n\n{LEAD_INSTRUCTIONS}{routing}",
+            user_message=message, history=self.history, cwd=self.cwd,
+            config=self.config, approval_callback=collaboration.approval,
+            skill_context_buffer=self.skill_context_buffer, max_turns=self.max_turns,
+            before_finish=collaboration.pending_instruction,
+        )
+        try:
+            async with aclosing(stream):
+                async for event in stream:
+                    if event.get("type") == "done":
+                        await collaboration.close()
+                        self.history = list(event.get("messages") or [])
+                        self.last_usage = (
+                            Usage.from_mapping(event.get("usage") or {})
+                            + collaboration.budget.usage
+                            + workflows.usage
+                        )
+                        self.last_cost = calculate_costs(self.llm_client, self.last_usage) or {}
+                        event = {
+                            **event, "usage": self.last_usage.to_dict(), "cost": self.last_cost,
+                            "total_tokens": self.last_usage.total_tokens,
+                            "total_turns": (
+                                event["total_turns"] + collaboration.budget.calls + workflows.calls
+                            ),
+                        }
+                    yield event
+        finally:
+            await collaboration.close()
 
     async def _run_plan(self, message: str) -> AsyncIterator[dict[str, Any]]:
         """交给 Plan 编排器生成并执行任务图，再接收其历史和统计。"""
@@ -193,13 +218,14 @@ class Agent:
 
     async def _run_team(self, message: str) -> AsyncIterator[dict[str, Any]]:
         """交给多 Agent 编排器执行任务，再接收其历史和统计。"""
-        orchestrator = AgentOrchestrator(
+        from paicli.agent.team import TeamCoordinator
+
+        orchestrator = TeamCoordinator(
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
             config=self.config,
             cwd=self.cwd,
             approval_callback=self.approval_callback,
-            default_worker_mode="react",
         )
         async for event in orchestrator.run(message):
             if event.get("type") == "done":

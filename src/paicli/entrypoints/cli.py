@@ -87,6 +87,10 @@ def main(
         str,
         typer.Option("--worker-mode", help="Sub-Agent worker mode in team runs: react or plan"),
     ] = "react",
+    confirm_plan: Annotated[
+        bool,
+        typer.Option("--confirm-plan", help="Ask before executing /plan in interactive mode"),
+    ] = False,
     # 输出格式
     json_output: Annotated[
         bool,
@@ -110,6 +114,10 @@ def main(
     _ = version
     if ctx.invoked_subcommand is not None:
         return
+    if confirm_plan and prompt is not None:
+        raise typer.BadParameter(
+            "requires an interactive session without --prompt", param_hint="--confirm-plan"
+        )
 
     root = (cwd or Path.cwd()).resolve()
 
@@ -152,7 +160,7 @@ def main(
             )
         )
     else:
-        asyncio.run(start_repl(str(root), config))
+        asyncio.run(start_repl(str(root), config, confirm_plan=confirm_plan))
 
 
 # ---------------------------------------------------------------------------

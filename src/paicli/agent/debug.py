@@ -36,11 +36,23 @@ from paicli.harness.impact import plan_impact
 from paicli.harness.verification import create_baseline, verify_run
 from paicli.llm.pricing import calculate_costs
 from paicli.rag.knowledge import KnowledgeIndex
-from paicli.tools.base import Tool, ToolResult
+from paicli.tools.base import Tool, ToolContext, ToolResult
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, Usage
 
 _READ_TOOLS = {"read_file", "read_evidence", "grep_code", "glob_files"}
+
+
+def is_application_source(path: Path) -> bool:
+    """Debug 只接手现有的应用源码，测试和运行配置保持原样。"""
+    name = path.name.casefold()
+    return (
+        path.suffix == ".py"
+        and not any(part.casefold() in INTERNAL_DIRS | {"tests"} for part in path.parts)
+        and not name.startswith("test_")
+        and not name.endswith("_test.py")
+        and name not in {"conftest.py", "setup.py"}
+    )
 
 
 def _surface(text):
@@ -99,6 +111,10 @@ class DebugCoordinator:
         max_tools=None,
         max_models=None,
         use_knowledge=False,
+        python_executable=None,
+        project_lock_root=None,
+        prefer_final_verify=False,
+        proposed_edit=None,
     ):
         """接收调试约束，并构建 baseline、repair、verify、review 四阶段图。"""
         if not 1 <= max_attempts <= 5:
@@ -113,6 +129,10 @@ class DebugCoordinator:
         )
         self.limits = {"tokens": max_tokens, "tools": max_tools, "models": max_models}
         self.use_knowledge = use_knowledge
+        self.python_executable = python_executable
+        self.project_lock_root = project_lock_root or self.cwd
+        self.prefer_final_verify = prefer_final_verify
+        self.proposed_edit = proposed_edit
         # 外层图控制业务阶段，节点内的修复和调查复用 query 工具循环。
         graph = StateGraph(DebugState)
         for name in ("baseline", "repair", "verify", "review"):
@@ -133,7 +153,7 @@ class DebugCoordinator:
     def catalogue(self):
         return sorted(name for name in self.execution.expected if name.endswith(".py"))
 
-    @recorded_run("debug")
+    @recorded_run("debug", independent=True)
     async def run(self, message="", *, resume=None):
         """初始化或恢复一次调试，管理取消监听，并汇总图执行、证据与累计用量。"""
         self.goal = message
@@ -340,8 +360,15 @@ class DebugCoordinator:
     def _instructions(self, role):
         """按修复、调查、审核角色提供不同职责与提交要求。"""
         if role == AgentRole.REPAIRER:
+            test_guidance = (
+                "Use run_tests only when a result would change your next action. "
+                "Submit the fix promptly after a supported edit. The independent verifier "
+                "immediately runs the full locked tests."
+                if self.prefer_final_verify
+                else "Use run_tests to check hypotheses for the user's bug."
+            )
             return (
-                "Read, edit and use run_tests to check hypotheses for the user's bug. "
+                f"Read and edit the application source. {test_guidance} "
                 "Continue until the complete patch is ready, then finish_task. You may follow "
                 "dependencies anywhere inside the project. There is no separate read/write quota; "
                 "all actions share the run budget. Use investigate only for a specific independent "
@@ -567,13 +594,8 @@ class DebugCoordinator:
                     relative = path.relative_to(root)
                     if (
                         not path.is_file()
-                        or path.suffix != ".py"
+                        or not is_application_source(relative)
                         or relative.as_posix().casefold() in self.protected
-                        or any(p.casefold() in INTERNAL_DIRS | {"tests"} for p in relative.parts)
-                        or path.name.casefold().startswith("test_")
-                        or path.name.casefold().endswith("_test.py")
-                        or path.name.casefold() == "conftest.py"
-                        or path.name.casefold() == "setup.py"
                     ):
                         raise ValueError(
                             "Debug can edit existing application Python only; "
@@ -606,7 +628,8 @@ class DebugCoordinator:
                     is_concurrency_safe=False,
                 )
             )
-            if self.state.get("focus_only") or self._investigation_pool() <= 0:
+            parallel = self._investigation_limit()
+            if parallel <= 0 or self._investigation_pool() <= 0:
                 current_run().record(
                     "debug.degraded",
                     reason="repair_focus"
@@ -617,7 +640,7 @@ class DebugCoordinator:
             registry.register(
                 Tool(
                     "investigate",
-                    "Delegate an independent evidence gap to at most two read-only specialists. "
+                    "Delegate independent evidence gaps to read-only specialists. "
                     "Overlapping focus paths are merged.",
                     {
                         "type": "object",
@@ -625,7 +648,7 @@ class DebugCoordinator:
                             "questions": {
                                 "type": "array",
                                 "minItems": 1,
-                                "maxItems": 2,
+                                "maxItems": parallel,
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -682,39 +705,46 @@ class DebugCoordinator:
             self.execution.remaining_tokens - total * 3 // 5,
         )
 
+    def _investigation_limit(self) -> int:
+        return max(0, min(self.config.team.max_active_workers, self.execution.remaining_models - 2))
+
     async def _investigate(self, payload, _context):
-        """按具体证据缺口启动最多两个只读调查任务，合并重叠范围并共享调用预算。
+        """按剩余预算启动彼此独立的调查任务，合并重叠范围并共享调用预算。
 
         输入范围用于聚焦问题，调查员可在项目内追踪依赖；实际边界还包括
         内部目录排除、只读工具和读取次数限制。结论必须携带可核对的来源。
         """
+        limit = self._investigation_limit()
         data = payload["questions"]
-        if not isinstance(data, list) or not 1 <= len(data) <= 2:
-            raise ValueError("Provide one or two concrete investigation questions")
-        specs = [
-            TaskSpec.parse(f"inspect-{len(self.state['findings']) + i}", q, self.cwd)
-            for i, q in enumerate(data, 1)
-        ]
-        if len(specs) == 2 and any(
-            (Path(self.cwd) / a).is_relative_to(Path(self.cwd) / b)
-            or (Path(self.cwd) / b).is_relative_to(Path(self.cwd) / a)
-            for a in specs[0].read_scope
-            for b in specs[1].read_scope
-        ):
-            specs = [
-                replace(
-                    specs[0],
-                    question="\n".join(s.question for s in specs),
-                    read_scope=list(dict.fromkeys(p for s in specs for p in s.read_scope)),
-                )
-            ]
         limits = self.execution.data["limits"]
         pool = self._investigation_pool()
-        if pool <= 0:
+        if limit <= 0 or pool <= 0:
             current_run().record("debug.degraded", reason="investigation_reserve")
             return ToolResult(
                 "Investigation budget reserved for implementation/review. Use current evidence."
             )
+        if not isinstance(data, list) or not 1 <= len(data) <= limit:
+            raise ValueError(f"Provide 1 to {limit} concrete investigation questions")
+        specs = []
+        root = Path(self.cwd)
+        for i, question in enumerate(data, 1):
+            spec = TaskSpec.parse(f"inspect-{len(self.state['findings']) + i}", question, self.cwd)
+            overlaps = [
+                previous for previous in specs
+                if any(
+                    (root / a).is_relative_to(root / b) or (root / b).is_relative_to(root / a)
+                    for a in previous.read_scope for b in spec.read_scope
+                )
+            ]
+            if overlaps:
+                joined = [*overlaps, spec]
+                spec = replace(
+                    overlaps[0],
+                    question="\n".join(item.question for item in joined),
+                    read_scope=list(dict.fromkeys(p for item in joined for p in item.read_scope)),
+                )
+                specs = [item for item in specs if item not in overlaps]
+            specs.append(spec)
 
         async def worker(spec):
             focus = spec.read_scope
@@ -795,6 +825,29 @@ class DebugCoordinator:
             }
         self._phase("主执行器持续阅读、修改并验证")
         state["attempts"] += 1
+        if self.proposed_edit is not None and state["attempts"] == 1:
+            name, payload = self.proposed_edit
+            tool = self._registry(writable=True).get(name)
+            if tool:
+                try:
+                    proposal = await tool.execute(
+                        payload, ToolContext(cwd=self.cwd, config=self.config)
+                    )
+                except ValueError as exc:
+                    proposal = ToolResult(str(exc), is_error=True)
+                current_run().record(
+                    "debug.proposed_edit", tool=name,
+                    applied=bool(self.changes), is_error=proposal.is_error,
+                )
+                if not proposal.is_error and self.changes:
+                    patch, risks = self._patch()
+                    return {
+                        "patch": patch,
+                        "risks": risks,
+                        "repair_text": proposal.content,
+                        "next": "verify",
+                    }
+                state["feedback"] = f"主会话的候选编辑未能应用：{proposal.content[:1000]}"
         spec = TaskSpec(
             "repairer",
             "repair",
@@ -1122,7 +1175,10 @@ class DebugCoordinator:
     async def _baseline(self, state: DebugState) -> dict:
         """复现现有测试失败，登记受保护文件与证据；未建立有效失败基线时停止调试。"""
         self._phase("复现现有测试失败")
-        report = await create_baseline(Path(self.cwd), self.targets, timeout=self.timeout)
+        report = await create_baseline(
+            Path(self.cwd), self.targets,
+            python_executable=self.python_executable, timeout=self.timeout,
+        )
         contract = json.loads(Path(report["contract_path"]).read_text(encoding="utf-8"))
         self.protected = {name.casefold() for name in contract["protected"]}
         for artifact in report.get("artifacts", {}).values():

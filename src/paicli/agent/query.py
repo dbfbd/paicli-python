@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from paicli.config import PaiCliConfig
@@ -33,6 +33,7 @@ async def query(
     approval_callback=None,
     skill_context_buffer=None,
     max_turns: int = 20,
+    before_finish: Callable[[], str] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """在限定轮数内交替调用模型和工具，向外产出统一事件。
 
@@ -47,8 +48,6 @@ async def query(
         *(history or []),
         Message(role="user", content=parse_image_references(user_message, cwd)),
     ]
-    # 模型只接收工具说明；对应的本地处理函数留在注册表中。
-    tool_definitions = tool_registry.definitions()
     executor = ToolExecutor(tool_registry)
     context = ToolContext(
         cwd=cwd,
@@ -91,6 +90,8 @@ async def query(
         stop_reason = "end_turn"
         turn_usage = Usage()
         tool_states: dict[int, dict[str, Any]] = {}
+        # 当前工具的结果可能解锁下一轮的专用能力。
+        tool_definitions = tool_registry.definitions()
 
         if config.features.context_compression:
             compression = context_manager.prepare(
@@ -159,6 +160,9 @@ async def query(
         if stop_reason == "max_tokens":
             break
         if stop_reason != "tool_use" and not tool_calls:
+            if before_finish and (reminder := before_finish()):
+                messages.append(Message(role="user", content=reminder))
+                continue
             completed = True
             break
 

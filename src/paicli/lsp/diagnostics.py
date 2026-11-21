@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import py_compile
+from traceback import format_exception_only
 from pathlib import Path
 
 
@@ -9,7 +9,7 @@ def diagnose_file(path: str | Path) -> list[str]:
     if file_path.suffix != ".py":
         return []
     try:
-        py_compile.compile(str(file_path), doraise=True)
-    except py_compile.PyCompileError as exc:
-        return [str(exc)]
+        compile(file_path.read_bytes(), str(file_path), "exec", dont_inherit=True)
+    except SyntaxError as exc:
+        return ["".join(format_exception_only(type(exc), exc)).rstrip()]
     return []

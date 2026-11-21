@@ -91,6 +91,21 @@ class PromptConfig:
 
 
 @dataclass(slots=True)
+class PlanConfig:
+    max_concurrent_tasks: int = 5
+    auto_route: bool = False
+
+
+@dataclass(slots=True)
+class TeamConfig:
+    max_active_workers: int = 5
+    max_worker_turns: int = 18
+    max_model_calls: int = 48
+    max_tokens: int = 200_000
+    timeout: float = 360
+
+
+@dataclass(slots=True)
 class FeatureConfig:
     mcp: bool = True
     skill: bool = True
@@ -110,6 +125,8 @@ class PaiCliConfig:
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     prompt: PromptConfig = field(default_factory=PromptConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
+    plan: PlanConfig = field(default_factory=PlanConfig)
+    team: TeamConfig = field(default_factory=TeamConfig)
 
 
 def load_config(
@@ -288,6 +305,8 @@ def _dict_to_config(data: dict[str, Any]) -> PaiCliConfig:
         policy=PolicyConfig(**data.get("policy", {})),
         prompt=PromptConfig(**data.get("prompt", {})),
         features=FeatureConfig(**data.get("features", {})),
+        plan=PlanConfig(**data.get("plan", {})),
+        team=TeamConfig(**data.get("team", {})),
     )
 
 

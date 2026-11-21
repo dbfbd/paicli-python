@@ -271,6 +271,7 @@ class SubAgent:
             approval_callback=self.approval_callback,
             manage_snapshots=False,
             max_concurrent_tasks=1,
+            staged_planning=False,
         )
         text = ""
         usage = Usage()

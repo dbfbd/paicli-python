@@ -14,12 +14,13 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.styles import Style
 from rich.console import Console
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 from paicli import __version__
 from paicli.agent import Agent, AgentOrchestrator, PlanExecuteAgent
 from paicli.agent.debug import DebugCoordinator
+from paicli.agent.team import TeamCoordinator
 from paicli.bootstrap import build_tool_registry
 from paicli.config import PaiCliConfig, config_to_public_dict
 from paicli.entrypoints.model_selector import ModelSelectorState, run_model_selector
@@ -54,9 +55,6 @@ SLASH_COMMANDS = [
     "/audit",
     "/index",
     "/search",
-    "/plan",
-    "/team",
-    "/debug",
     "/model",
     "/usage",
     "/skill",
@@ -99,7 +97,7 @@ class PermissionModeController:
         return self.set("auto" if self.mode == "default" else "default")
 
 
-async def start_repl(cwd: str, config: PaiCliConfig) -> None:
+async def start_repl(cwd: str, config: PaiCliConfig, *, confirm_plan: bool = False) -> None:
     console = Console()
     permission_mode = PermissionModeController(config)
     registry, mcp_manager = await build_tool_registry(config=config, cwd=cwd)
@@ -198,6 +196,7 @@ async def start_repl(cwd: str, config: PaiCliConfig) -> None:
                 registry,
                 permission_mode,
                 renderer,
+                confirm_plan=confirm_plan,
             )
             if should_exit:
                 return
@@ -229,6 +228,8 @@ async def _handle_slash(
     registry: ToolRegistry,
     permission_mode: PermissionModeController,
     renderer: RichRenderer,
+    *,
+    confirm_plan: bool = False,
 ) -> bool:
     command, _, rest = raw.partition(" ")
     arg = rest.strip()
@@ -294,10 +295,11 @@ async def _handle_slash(
                 config=config,
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
+                plan_approval=(lambda _plan: _confirm_plan(console)) if confirm_plan else None,
             )
             await _run_events(
                 plan_agent.run(arg),
-                RichRenderer(),
+                RichRenderer(console=console),
                 agent.llm_client.max_context_window,
             )
     elif command == "/team":
@@ -309,13 +311,15 @@ async def _handle_slash(
             except ValueError as exc:
                 console.print(f"[red]{exc}[/red]")
                 return False
-            orchestrator = AgentOrchestrator(
+            coordinator = TeamCoordinator if worker_mode == "react" else AgentOrchestrator
+            options = {} if worker_mode == "react" else {"default_worker_mode": worker_mode}
+            orchestrator = coordinator(
                 llm_client=agent.llm_client,
                 tool_registry=registry,
                 config=config,
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
-                default_worker_mode=worker_mode,
+                **options,
             )
             await _run_events(
                 orchestrator.run(team_task),
@@ -655,6 +659,15 @@ def _snapshot_command(arg: str, console: Console, cwd: str) -> None:
         f"{index}. {row.id} {row.phase} {row.created_at}" for index, row in enumerate(rows, 1)
     )
     console.print(output or "(no snapshots)")
+
+
+def _confirm_plan(console: Console) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return Confirm.ask("Execute this plan?", default=False, console=console)
+    except (EOFError, KeyboardInterrupt):
+        return False
 
 
 def _approval_prompt(

@@ -46,6 +46,8 @@ class Task:
     error: str = ""
     start_time: float = 0.0
     end_time: float = 0.0
+    expected_output: str = ""
+    verification: str = ""
 
     def add_dependency(self, task_id: str) -> None:
         if task_id not in self.dependencies:

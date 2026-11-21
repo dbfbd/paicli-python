@@ -10,14 +10,14 @@ MAX_FILES, MAX_FILE_BYTES, MAX_BYTES, MAX_TESTS = 256, 256 * 1024, 4 * 1024 * 10
 
 def _module(name):
     parts = list(Path(name).with_suffix("").parts)
-    if parts[0] == "src":
+    if len(parts) > 1 and parts[0] == "src":
         parts.pop(0)
     if parts[-1] == "__init__":
         parts.pop()
     return ".".join(parts)
 
 
-def _imports(name, text):
+def import_names(name: str, text: str) -> set[str]:
     module, result = _module(name), set()
     for node in ast.walk(ast.parse(text, filename=name)):
         if isinstance(node, ast.Import):
@@ -32,12 +32,29 @@ def _imports(name, text):
     return result
 
 
+def local_dependencies(imports: dict[str, set[str]]) -> dict[str, set[str]]:
+    """将静态导入映射到已知文件，优先匹配完整模块路径。"""
+    modules = {_module(name): name for name in imports}
+    dependencies = {}
+    for name, refs in imports.items():
+        matches = set()
+        for ref in refs:
+            while ref:
+                if ref in modules:
+                    if modules[ref] != name:
+                        matches.add(modules[ref])
+                    break
+                ref = ref.rpartition(".")[0]
+        dependencies[name] = matches
+    return dependencies
+
+
 def _test(name):
     p = Path(name)
     return "tests" in p.parts or p.name.startswith("test_") or p.name.endswith("_test.py")
 
 
-def plan_impact(root, repair_files, targets, catalogue, test_sources=()):
+def plan_impact(root, repair_files, targets, catalogue, test_sources=(), *, include_imports=False):
     """在扫描和测试数量上限内反向追踪导入依赖，补充相关测试并报告未分析部分。"""
     root = Path(root).resolve()
     imports, unknown, total = {}, [], 0
@@ -54,30 +71,12 @@ def plan_impact(root, repair_files, targets, catalogue, test_sources=()):
             if len(raw) != size:
                 raise ValueError("source changed while reading")
             total += size
-            imports[name] = _imports(name, raw.decode("utf-8-sig"))
+            imports[name] = import_names(name, raw.decode("utf-8-sig"))
         except (OSError, ValueError, SyntaxError, RecursionError) as exc:
             unknown.append(f"{name}: {type(exc).__name__}")
     if len(names) > MAX_FILES:
         unknown.append(f"Only {MAX_FILES}/{len(names)} Python files scanned")
-    modules = {_module(name): name for name in imports}
-    dependencies = {
-        name: {
-            modules[prefix]
-            for dep in refs
-            for prefix in [
-                next(
-                    (
-                        dep[:i]
-                        for i in range(len(dep), 0, -1)
-                        if dep[:i] in modules and (i == len(dep) or dep[i] == ".")
-                    ),
-                    "",
-                )
-            ]
-            if prefix
-        }
-        for name, refs in imports.items()
-    }
+    dependencies = local_dependencies(imports)
     affected = set(repair_files)
     while True:
         related = affected | {name for name, deps in dependencies.items() if deps & affected}
@@ -95,7 +94,7 @@ def plan_impact(root, repair_files, targets, catalogue, test_sources=()):
     selected, deferred = candidates[:MAX_TESTS], candidates[MAX_TESTS:]
     if deferred:
         unknown.append(f"{len(deferred)} optional test files deferred by the regression budget")
-    return {
+    result = {
         "repair_files": list(repair_files),
         "targets": list(dict.fromkeys(mandatory + selected)),
         "mandatory_targets": mandatory,
@@ -109,3 +108,9 @@ def plan_impact(root, repair_files, targets, catalogue, test_sources=()):
         "note": "Import dependencies are candidates only; "
         "dynamic imports and execution coverage are not inferred",
     }
+    if include_imports:
+        result["affected_imports"] = {
+            name: sorted(dependencies.get(name, set()) & affected)
+            for name in sorted(affected)
+        }
+    return result

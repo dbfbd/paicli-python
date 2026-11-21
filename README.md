@@ -1,23 +1,22 @@
 # PaiCLI
 
-**在本地 Python 项目中复现故障、协作修复，并用已有测试独立验收。**
+**在终端里阅读代码、规划改动和协作开发。**
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-PaiCLI 是一个终端 Agent 工具，提供 CLI、交互会话和 Python SDK。项目基于开源 PaiCLI 二次开发，重构了执行循环与任务调度，增加面向 Python 缺陷修复的 Debug 工作流。开发者指定目标目录、故障描述和已有 pytest 用例，系统保存失败基线、调查和修改源码，再根据真实测试结果决定返修或交付。
-
-适合已有测试的个人项目排障，也可以用 ReAct、Plan、Team 模式阅读代码、拆分任务和协作分析。
+PaiCLI 是一个终端编程 Agent，提供交互式 CLI 和 Python SDK。进入项目后可以直接提问、让 Agent 阅读代码，或描述需要实现的改动。单会话可以完成日常的阅读、修改与自测，可独立交付的模块也可以交给多个 Worker 并行开发。遇到可复现的 Python 测试失败时，可以指定用例，由 Debug 记录失败基线、修复并运行回归测试。
 
 **核心技术**：Python、LangGraph、asyncio、Tool Calling、MCP、SQLite/FTS5、FastEmbed（多语 E5）、pytest、HTTPX。
 
-[快速开始](#快速开始) · [执行模式](#执行模式) · [Debug 工作流](#debug-工作流) · [项目资料检索](#项目资料检索) · [Python SDK](#python-sdk) · [项目结构](#项目结构)
+[快速开始](#快速开始) · [执行链路](#执行链路) · [Debug 工作流](#debug-工作流) · [项目资料检索](#项目资料检索) · [Python SDK](#python-sdk) · [项目结构](#项目结构)
 
 ## 可以做什么
 
 | 能力 | 实现方式 |
 | --- | --- |
-| 多 Agent 协作 | Plan/Team 共用 LangGraph 调度器，按任务 DAG 分派，只读任务有界并行，写入任务独占执行 |
+| 规划与执行 | 调查仓库后生成任务计划，按依赖调度。遇到可核实的阻塞时允许一次局部重规划 |
+| 多 Agent 协作 | 主 Agent 按需委派调查或实现，Worker 在独立 Git worktree 工作。组合检查通过后才交付补丁 |
 | 受控修复 | 主修复 Agent 按需委派只读调查，高风险补丁通过测试后进入独立审核 |
 | 回归验收 | 固定测试和执行条件，检查目标失败用例转为通过，以及原通过用例保持通过 |
 | 可回查证据 | 原始工具输出和测试结果落盘，角色结论关联来源、行号与源码版本 |
@@ -60,37 +59,45 @@ uv run --locked --extra dev paicli --cwd ../your-project
 
 ```text
 概述这个项目的模块和入口
-/plan 分别梳理核心模块，并汇总依赖关系
-/team 检查核心模块中的输入校验与异常处理
-/debug tests/test_example.py :: 描述故障与预期行为
+/plan 先梳理批量导入的调用路径，再列出改动步骤
+/team 并行补齐 CSV 和 JSONL 解析模块，各自运行单测，最后统一验收
+tests/test_example.py 里有失败用例，请先复现再修复
 /help
 ```
 
 `/debug` 使用两侧带空格的 ` :: ` 分隔测试目标和故障描述。
 
-## 执行模式
+用 `paicli --confirm-plan` 启动交互会话后，`/plan` 会展示计划，并询问是否开始执行。单次请求和 SDK 默认直接执行。SDK 如需确认，可向 `engine.plan(..., plan_approval=callback)` 传入返回布尔值的回调。
 
-| 模式 | 适用任务 | 执行入口 |
-| --- | --- | --- |
-| ReAct | 直接阅读、搜索和完成边界明确的小任务 | `paicli -p '任务'` |
-| Plan | 先生成带依赖的计划，再执行子任务 | `paicli --mode plan -p '任务'` |
-| Team | 规划、工作和评审角色协作 | `paicli --mode team -p '任务'` |
-| Debug | 根据已有失败测试定位、修改并独立验收 Python 源码 | `paicli debug --tests ... -p '故障'` |
+Plan 的并发上限默认为 5。可在 `.paicli/config.json` 中设置 `{"plan": {"max_concurrent_tasks": 3}}`。只有依赖已经满足的只读任务可以并行。
 
-模式由命令或交互入口显式选择。Plan/Team 的子任务依赖构成 DAG，外层 LangGraph 持续调度，局部审核拒绝可以触发有限重试。
+## 执行链路
+
+普通输入和 SDK 的 `ask()` 都由主 Agent 处理。主 Agent 先读代码、确认改动范围，再决定自己执行，还是委派带文件范围和验收条件的子任务。委派后，主 Agent 可以继续处理公共入口或准备集成检查。
+
+`/plan` 适合先搞清依赖再动手的任务。它先调查项目并展示计划，执行时按依赖调度，遇到已核实的阻塞可以局部重规划一次。若要允许主 Agent 按需走规划路径，在 `.paicli/config.json` 中设置 `{"plan": {"auto_route": true}}`。主 Agent 调用 `plan_change` 后，LangGraph 路由会扫描 Python 调用方和候选测试，再决定交回分析结果或启动已准备好的协作组。
+
+主 Agent 也可以为已有失败用例发起隔离调试。这条路径会先在独立候选版本上验收修复，再应用通过检查的补丁。
 
 ```mermaid
 flowchart LR
-    Request[CLI / REPL / SDK] --> Engine[QueryEngine]
-    Engine --> React[ReAct]
-    Engine --> Planning[Plan / Team]
-    Planning --> Runner[WorkflowRunner]
-    Runner --> Tasks[依赖就绪的 SubAgent 任务]
-    Engine --> Debug[DebugCoordinator]
-    React --> Loop[共用 query 工具循环]
-    Tasks --> Loop
-    Debug --> Loop
+    Request[CLI / REPL / SDK] --> Lead[主 Agent 与工具循环]
+    Lead --> Work[在原工作区处理公共部分]
+    Lead -->|按需委派| Workers[隔离的 Worker 工作区]
+    Work --> Check[组合候选并按提交检查]
+    Workers --> Check
+    Check -->|按权限应用已验证补丁| Lead
 ```
+
+### Team 并行开发
+
+可以用 `/team` 或 Python SDK 的 `engine.team()` 显式启动整组任务。Team 需要一个已有初始提交的 Git 仓库。调度器按任务依赖和文件写入范围派工。每个 Worker 在独立的 Git worktree 中实现自己的部分，可以按任务编号发消息、提交修改请求，或向下游发布带 Git 版本的交接代码。
+
+系统把 Worker 补丁组合成一个候选版本。如果是普通会话中的主 Agent 发起委派，候选还会纳入主工作区的跟踪改动和委派时声明的新文件。各模块可以登记自己的检查，跨模块的检查在候选版本上统一运行。连续且明确标记为 `parallel_safe: true` 的独立检查可以并行，各自在同一候选提交的独立工作区运行。
+
+检查失败时，负责该部分的 Worker 可在原会话内按具体报错返修。主 Agent 若发现自己的验收断言与需求冲突，可以记录理由并更正失败检查，再复用已有产物重新验收。组合通过后会保存 `.patch`。应用前会再次核对主工作区，避免应用基于旧文件的补丁。
+
+组合检查和应用补丁沿用现有审批。交互终端可以直接审批，SDK 可传入 `approval_callback`。可在项目配置的 `team` 下设置 `max_active_workers`、`max_worker_turns`、`max_model_calls`、`max_tokens` 和 `timeout`。
 
 ## Debug 工作流
 
@@ -107,7 +114,7 @@ flowchart TD
     Review -->|审核通过| Done
 ```
 
-主修复 Agent 保留修复会话。互不重叠的调查最多两个并行，重叠范围会合并。调查结论携带证据引用，程序核对产物完整性和对应源码版本。
+主修复 Agent 保留修复会话。互不重叠的调查可以并行，并发数由 `team.max_active_workers`（默认 5）和剩余预算决定。重叠范围会合并。调查结论携带证据引用，程序核对产物完整性和对应源码版本。
 
 Harness 在工具执行层限制权限与写入范围。Debug 允许修改项目中已有的应用 Python 文件，测试、配置与依赖清单受保护。同一项目的 Debug 任务通过文件锁协调写入。
 
@@ -158,6 +165,7 @@ Debug 在故障复现后按需检索资料，角色共享这组引用。源码�
 - **上下文**按完整工具批次保留近期消息，旧历史生成提取式摘要，保留任务目标和证据引用。长输出落盘供后续回读。
 - **项目记忆**以 SQLite 按项目保存偏好与约束，匹配采用有容量限制的 LRU/TTL 缓存，记录更新后失效。
 - **MCP Client**读取用户级或项目级 `.paicli/mcp.json`，连接、握手和请求受超时控制，单个服务加载失败时保留其他工具。
+- **精确编辑**在旧文本匹配多处时返回候选行号，可通过更完整的上下文或行范围定位。
 - **工具错误反馈**区分参数、超时、权限和服务异常。读取失败时提示选择能读取同一来源的备用工具，写操作超时提示先核实是否生效。
 
 使用 `paicli mcp list` 查看配置，使用 `paicli mcp serve --transport stdio` 对外提供内置工具。实际工具范围由入口和角色决定。
@@ -217,8 +225,6 @@ src/paicli/
 - 资料检索面向小型本地语料，向量保存在 SQLite 并做有界精确检索。
 - 程序级权限、预算与证据检查按具体入口生效，Debug 的专门约束由协调器和 Harness 实施。
 
-## 来源与许可证
+## 许可证
 
-基于 [itwanger/PaiCLI-Python](https://github.com/itwanger/PaiCLI-Python) 二次开发。本仓库重构了共享执行层和 LangGraph 调度，增加受控 Debug、独立验收、证据管理、恢复与项目资料检索。
-
-遵循 [MIT License](LICENSE)，保留原项目版权声明。
+本项目采用 [MIT License](LICENSE)。

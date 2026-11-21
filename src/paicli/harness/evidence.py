@@ -238,17 +238,20 @@ def evidence_context(text: str, artifact: dict | None, limit: int = 1800) -> str
     )
 
 
-def recorded_run(mode: str | None = None) -> Callable:
+def recorded_run(mode: str | None = None, *, independent: bool = False) -> Callable:
     """为一次执行建立证据上下文，避免向事件消费者泄漏上下文，并为 Debug 管理项目锁。"""
 
     def decorate(method):
         @wraps(method)
         async def wrapped(self, *args, **kwargs):
-            if current_run() is not None:
+            if current_run() is not None and not independent:
                 async for event in method(self, *args, **kwargs):
                     yield event
                 return
-            lease = project_lease(self.cwd) if mode == "debug" else nullcontext()
+            lease = (
+                project_lease(getattr(self, "project_lock_root", self.cwd))
+                if mode == "debug" else nullcontext()
+            )
             with lease:
                 consumer = consume(self, args, kwargs)
                 try:
