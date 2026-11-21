@@ -14,12 +14,11 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.styles import Style
 from rich.console import Console
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 
 from paicli import __version__
-from paicli.agent import Agent, AgentOrchestrator, PlanExecuteAgent
-from paicli.agent.debug import DebugCoordinator
+from paicli.agent import Agent
 from paicli.agent.team import TeamCoordinator
 from paicli.bootstrap import build_tool_registry
 from paicli.config import PaiCliConfig, config_to_public_dict
@@ -37,6 +36,7 @@ from paicli.prompt import PromptAssembler
 from paicli.rag import CodeIndex
 from paicli.render import RichRenderer
 from paicli.runtime import DurableTaskManager
+from paicli.runtime.tasks import TASK_MODES
 from paicli.skill import SkillRegistry
 from paicli.snapshot import SnapshotService
 from paicli.tools import ToolRegistry
@@ -60,6 +60,7 @@ SLASH_COMMANDS = [
     "/skill",
     "/mcp",
     "/task",
+    "/team",
     "/snapshot",
     "/restore",
 ]
@@ -97,7 +98,7 @@ class PermissionModeController:
         return self.set("auto" if self.mode == "default" else "default")
 
 
-async def start_repl(cwd: str, config: PaiCliConfig, *, confirm_plan: bool = False) -> None:
+async def start_repl(cwd: str, config: PaiCliConfig) -> None:
     console = Console()
     permission_mode = PermissionModeController(config)
     registry, mcp_manager = await build_tool_registry(config=config, cwd=cwd)
@@ -196,7 +197,6 @@ async def start_repl(cwd: str, config: PaiCliConfig, *, confirm_plan: bool = Fal
                 registry,
                 permission_mode,
                 renderer,
-                confirm_plan=confirm_plan,
             )
             if should_exit:
                 return
@@ -228,8 +228,6 @@ async def _handle_slash(
     registry: ToolRegistry,
     permission_mode: PermissionModeController,
     renderer: RichRenderer,
-    *,
-    confirm_plan: bool = False,
 ) -> bool:
     command, _, rest = raw.partition(" ")
     arg = rest.strip()
@@ -285,67 +283,27 @@ async def _handle_slash(
         results = CodeIndex(cwd).search(arg, limit=20)
         output = "\n".join(f"{r.path}:{r.line}: {r.snippet}" for r in results)
         console.print(output or "(no matches)")
-    elif command == "/plan":
-        if not arg:
-            console.print("[red]Usage:[/red] /plan <task>")
-        else:
-            plan_agent = PlanExecuteAgent(
-                llm_client=agent.llm_client,
-                tool_registry=registry,
-                config=config,
-                cwd=cwd,
-                approval_callback=agent.approval_callback,
-                plan_approval=(lambda _plan: _confirm_plan(console)) if confirm_plan else None,
-            )
-            await _run_events(
-                plan_agent.run(arg),
-                RichRenderer(console=console),
-                agent.llm_client.max_context_window,
-            )
     elif command == "/team":
         if not arg:
             console.print("[red]Usage:[/red] /team <task>")
         else:
             try:
-                worker_mode, team_task = _parse_mode_argument(arg)
+                _, team_task = _parse_mode_argument(arg, allowed={"react"})
             except ValueError as exc:
                 console.print(f"[red]{exc}[/red]")
                 return False
-            coordinator = TeamCoordinator if worker_mode == "react" else AgentOrchestrator
-            options = {} if worker_mode == "react" else {"default_worker_mode": worker_mode}
-            orchestrator = coordinator(
+            orchestrator = TeamCoordinator(
                 llm_client=agent.llm_client,
                 tool_registry=registry,
                 config=config,
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
-                **options,
             )
             await _run_events(
                 orchestrator.run(team_task),
                 RichRenderer(),
                 agent.llm_client.max_context_window,
             )
-    elif command == "/debug":
-        target, separator, goal = arg.partition(" :: ")
-        if not separator or not target.strip() or not goal.strip():
-            console.print(
-                "[red]Usage:[/red] /debug tests/test_existing.py :: <bug and intended behavior>"
-            )
-        else:
-            coordinator = DebugCoordinator(
-                llm_client=agent.llm_client,
-                tool_registry=registry,
-                config=config,
-                cwd=cwd,
-                targets=[target.strip().strip('"')],
-                approval_callback=agent.approval_callback,
-            )
-            await _run_events(
-                coordinator.run(goal.strip()), RichRenderer(), agent.llm_client.max_context_window
-            )
-            agent.last_usage = coordinator.usage
-            agent.last_cost = {}
     elif command == "/model":
         await _model_command(arg, console, cwd, config, agent, registry, renderer)
     elif command == "/usage":
@@ -622,7 +580,7 @@ def _task_command(arg: str, console: Console, cwd: str) -> None:
     sub, _, rest = arg.partition(" ")
     if sub == "add" and rest:
         try:
-            mode, prompt = _parse_mode_argument(rest, allowed={"react", "plan", "team"})
+            mode, prompt = _parse_mode_argument(rest, allowed=TASK_MODES)
         except ValueError as exc:
             console.print(f"[red]{exc}[/red]")
             return
@@ -659,15 +617,6 @@ def _snapshot_command(arg: str, console: Console, cwd: str) -> None:
         f"{index}. {row.id} {row.phase} {row.created_at}" for index, row in enumerate(rows, 1)
     )
     console.print(output or "(no snapshots)")
-
-
-def _confirm_plan(console: Console) -> bool:
-    if not sys.stdin.isatty():
-        return False
-    try:
-        return Confirm.ask("Execute this plan?", default=False, console=console)
-    except (EOFError, KeyboardInterrupt):
-        return False
 
 
 def _approval_prompt(
@@ -725,23 +674,17 @@ def _count_named_files(root: str, filename: str) -> int:
 def _parse_mode_argument(
     value: str,
     *,
-    allowed: set[str] | None = None,
+    allowed: set[str],
 ) -> tuple[str, str]:
-    modes = allowed or {"react", "plan"}
     parts = value.strip().split(maxsplit=2)
-    if len(parts) >= 2 and parts[0] in {"--mode", "-m"}:
-        mode = parts[1].lower()
-        if mode not in modes:
-            raise ValueError(f"mode must be one of: {', '.join(sorted(modes))}")
+    if parts and parts[0] in {"--mode", "-m", "--plan"}:
+        mode = parts[1].lower() if len(parts) >= 2 and parts[0] != "--plan" else ""
+        if mode not in allowed:
+            raise ValueError(f"mode must be one of: {', '.join(sorted(allowed))}")
         prompt = parts[2].strip() if len(parts) == 3 else ""
         if not prompt:
             raise ValueError("task text is required after --mode")
         return mode, prompt
-    if parts and parts[0] == "--plan":
-        prompt = value.strip()[len("--plan") :].strip()
-        if not prompt:
-            raise ValueError("task text is required after --plan")
-        return "plan", prompt
     return "react", value.strip()
 
 

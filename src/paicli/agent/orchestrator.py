@@ -1,26 +1,17 @@
-"""多 Agent 执行单元及通用 Team 编排，底层复用共享 query 和任务工作流。"""
+"""隔离角色上下文的子 Agent 执行单元。"""
 
 from __future__ import annotations
 
-import json
-import re
-from collections.abc import AsyncIterator, Callable
-from contextlib import suppress
-from dataclasses import asdict, dataclass, field, replace
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
 from paicli.agent.query import query
-from paicli.agent.workflow import ReviewResult, TaskOutcome, WorkerResult, WorkflowRunner
 from paicli.config import PaiCliConfig
-from paicli.harness.evidence import evidence_context, recorded_run
 from paicli.llm.base import LlmClient
-from paicli.llm.pricing import calculate_costs
-from paicli.plan import Task, TaskType
-from paicli.plan.validation import validate_plan_nodes
 from paicli.prompt import PromptAssembler
 from paicli.skill import SkillContextBuffer
-from paicli.snapshot import SnapshotService
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, Usage
 
@@ -42,20 +33,6 @@ class AgentMessageType(StrEnum):
     APPROVAL = "APPROVAL"
     REJECTION = "REJECTION"
     ERROR = "ERROR"
-
-
-class StepStatus(StrEnum):
-    PENDING = "PENDING"
-    RUNNING = "RUNNING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-    SKIPPED = "SKIPPED"
-    BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
-
-
-class AgentRunMode(StrEnum):
-    REACT = "react"
-    PLAN = "plan"
 
 
 @dataclass(slots=True)
@@ -119,17 +96,6 @@ class AgentMessage:
         )
 
 
-@dataclass(slots=True)
-class ExecutionStep:
-    id: str
-    description: str
-    type: str
-    dependencies: list[str]
-    mode: str = AgentRunMode.REACT.value
-    result: str = ""
-    status: StepStatus = StepStatus.PENDING
-
-
 class SubAgent:
     """隔离角色指令、消息历史和 Skill 缓冲区的执行单元。
 
@@ -147,8 +113,6 @@ class SubAgent:
         cwd: str,
         approval_callback=None,
         skill_context_buffer: SkillContextBuffer | None = None,
-        default_mode: str = AgentRunMode.REACT.value,
-        max_plan_depth: int = 1,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
         instructions: str = "",
         max_turns: int = 8,
@@ -162,8 +126,6 @@ class SubAgent:
         self.cwd = cwd
         self.approval_callback = approval_callback
         self.skill_context_buffer = skill_context_buffer or SkillContextBuffer()
-        self.default_mode = _normalize_worker_mode(default_mode)
-        self.max_plan_depth = max(1, max_plan_depth)
         self.event_callback = event_callback
         self.instructions = instructions
         self._prompt_override = system_prompt
@@ -174,11 +136,8 @@ class SubAgent:
         self,
         task: AgentMessage,
         context: str = "",
-        *,
-        mode: str | None = None,
-        plan_depth: int = 0,
     ) -> AgentMessage:
-        """组合任务和上下文，按角色及模式转入工具循环、嵌套规划或无工具调用。"""
+        """组合任务和上下文，根据角色使用工具循环或无工具调用。"""
         content = f"{context}\n\nCurrent task:\n{task.content}".strip() if context else task.content
         if self.role in {
             AgentRole.WORKER,
@@ -186,9 +145,6 @@ class SubAgent:
             AgentRole.REPAIRER,
             AgentRole.AUDITOR,
         }:
-            selected_mode = _normalize_worker_mode(mode or self.default_mode)
-            if selected_mode == AgentRunMode.PLAN:
-                return await self._execute_plan(content, plan_depth=plan_depth)
             return await self._execute_worker(content)
         return await self._execute_without_tools(content)
 
@@ -252,52 +208,6 @@ class SubAgent:
             )
         result = text.strip() or "\n".join(item for item in tool_results if item).strip()
         return AgentMessage.result(self.name, self.role, result, usage, turns, status, stop_reason)
-
-    async def _execute_plan(self, content: str, *, plan_depth: int) -> AgentMessage:
-        """在允许的嵌套深度内执行独立 Plan；子计划继承当前工具与权限边界。"""
-        if plan_depth >= self.max_plan_depth:
-            return AgentMessage.error(
-                self.name,
-                self.role,
-                f"nested Plan depth limit ({self.max_plan_depth}) reached",
-            )
-        from paicli.agent.plan_execute import PlanExecuteAgent
-
-        agent = PlanExecuteAgent(
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry,
-            config=self.config,
-            cwd=self.cwd,
-            approval_callback=self.approval_callback,
-            manage_snapshots=False,
-            max_concurrent_tasks=1,
-            staged_planning=False,
-        )
-        text = ""
-        usage = Usage()
-        turns = 0
-        status = "completed"
-        try:
-            async for event in agent.run(content):
-                self._forward_event(event)
-                kind = event.get("type")
-                if kind == "text_delta":
-                    text += str(event.get("text") or "")
-                elif kind == "usage":
-                    usage = usage + Usage.from_mapping(event.get("usage") or {})
-                elif kind == "done":
-                    usage = Usage.from_mapping(event.get("usage") or {})
-                    turns = int(event.get("total_turns") or 0)
-                    status = str(event.get("status") or "completed")
-                elif kind == "error":
-                    raise event["error"]
-        except Exception as exc:  # noqa: BLE001
-            return AgentMessage.error(self.name, self.role, str(exc), usage, turns)
-        self.history = [
-            Message(role="user", content=content),
-            Message(role="assistant", content=text),
-        ]
-        return AgentMessage.result(self.name, self.role, text.strip(), usage, turns, status)
 
     async def _execute_without_tools(self, content: str) -> AgentMessage:
         """不提供工具定义，收集角色的文本结果和用量，供规划或通用评审使用。"""
@@ -365,13 +275,8 @@ class SubAgent:
         ).build_static()
         role_prompt = {
             AgentRole.PLANNER: (
-                "You are the Planner in a multi-agent workflow. Return only JSON with a "
-                "steps array. Each step needs id, description, type, dependencies, and optional "
-                'mode ("react" or "plan"). Use plan only when a worker needs its own nested DAG. '
-                "Use FILE_READ or ANALYSIS only for read-only work without shell commands. "
-                "Use FILE_WRITE for modifications, COMMAND for shell operations, "
-                "VERIFICATION for running tests, or PLAN for a nested workflow needing writes. "
-                "Read-only workers cannot escalate their tool permissions."
+                "Analyze the assigned task. Propose steps, their dependencies, and how to "
+                "verify them. Return your plan without executing it."
             ),
             AgentRole.WORKER: (
                 "You are the Worker in a multi-agent workflow. Execute only the assigned "
@@ -428,331 +333,3 @@ class SubAgent:
         }:
             return f"{role_prompt}\n{self.instructions}\nAgent name: {self.name}"
         return f"{base}\n\n{role_prompt}\n{self.instructions}\nAgent name: {self.name}"
-
-
-class AgentOrchestrator:
-    """把团队计划转为共享工作流，由工作 Agent 执行并按任务审核和有限重试。"""
-
-    max_retries_per_step = 2
-
-    def __init__(
-        self,
-        *,
-        llm_client: LlmClient,
-        tool_registry: ToolRegistry,
-        config: PaiCliConfig,
-        cwd: str,
-        approval_callback=None,
-        worker_count: int = 2,
-        default_worker_mode: str = AgentRunMode.REACT.value,
-    ):
-        self.llm_client = llm_client
-        self.tool_registry = tool_registry
-        self.config = config
-        self.cwd = cwd
-        self.approval_callback = approval_callback
-        self.default_worker_mode = _normalize_worker_mode(default_worker_mode)
-        self.worker_count = max(1, worker_count)
-        self.planner = self._subagent("planner", AgentRole.PLANNER)
-        self.history: list[Message] = []
-        self.total_usage = Usage()
-        self.total_turns = 0
-        self.workflow: WorkflowRunner | None = None
-        self.status = "failed"
-
-    @recorded_run("team")
-    async def run(self, message: str) -> AsyncIterator[dict[str, Any]]:
-        """生成并校验团队计划，绑定执行和审核回调，再将最终任务状态汇总给调用方。"""
-        snapshot = SnapshotService(self.cwd)
-        with suppress(Exception):
-            snapshot.create("pre-turn")
-        self.total_usage = Usage()
-        self.total_turns = 0
-        self.status = "failed"
-        self.workflow = None
-        try:
-            yield {"type": "text_delta", "text": "Phase 1: planner\n\n"}
-            plan_result = await self.planner.execute(
-                AgentMessage.task("orchestrator", f"Create an execution plan for:\n{message}")
-            )
-            self.total_usage = plan_result.usage
-            self.total_turns = plan_result.turns
-            self.planner.clear_history()
-            if plan_result.type == AgentMessageType.ERROR:
-                raise RuntimeError(f"planner failed: {plan_result.content}")
-            steps = self.parse_plan(plan_result.content)
-            if not steps:
-                raise ValueError(f"planner output could not be parsed:\n{plan_result.content}")
-            yield {"type": "text_delta", "text": self.summarize_steps(steps) + "\n"}
-            yield {"type": "text_delta", "text": "Phase 2: workers and reviewer\n\n"}
-            tasks = [
-                Task(
-                    id=step.id,
-                    description=step.description,
-                    type=_task_type(step.type),
-                    dependencies=list(step.dependencies),
-                )
-                for step in steps
-            ]
-            by_id = {step.id: step for step in steps}
-
-            async def execute(task, dependencies, read_only, feedback, emit):
-                registry = self.tool_registry.read_only() if read_only else self.tool_registry
-                worker = self._subagent(
-                    f"worker-{task.id}",
-                    AgentRole.WORKER,
-                    tool_registry=registry,
-                    event_callback=emit,
-                )
-                context = "Overall task context:\n" + message
-                for dep_id, outcome in dependencies.items():
-                    context += f"\n[{dep_id}] {evidence_context(outcome.text, outcome.evidence)}"
-                if feedback:
-                    context += f"\n\nReviewer rejected the previous result:\n{feedback}"
-                if read_only:
-                    context += (
-                        "\nThis task is read-only; only the provided read tools are available."
-                    )
-                result = await worker.execute(
-                    AgentMessage.task("orchestrator", task.description),
-                    context,
-                    mode=by_id[task.id].mode,
-                )
-                status = result.status
-                error = result.content if result.type == AgentMessageType.ERROR else ""
-                if not result.content.strip() and status == "completed":
-                    status, error = "failed", "empty worker result"
-                return WorkerResult(
-                    text=result.content,
-                    usage=result.usage,
-                    turns=result.turns,
-                    status=status,
-                    error=error,
-                )
-
-            async def review(task, result, emit):
-                reviewer = self._subagent(
-                    f"reviewer-{task.id}",
-                    AgentRole.REVIEWER,
-                    event_callback=emit,
-                )
-                verdict = await reviewer.review(task.description, result.text)
-                review_error = verdict.content if verdict.type == AgentMessageType.ERROR else ""
-                if not review_error:
-                    try:
-                        payload = _parse_json_object(verdict.content)
-                        if type(payload.get("approved")) is not bool:
-                            raise ValueError("approved must be a JSON boolean")
-                    except (json.JSONDecodeError, ValueError) as exc:
-                        review_error = f"invalid reviewer response: {exc}"
-                approved = verdict.type != AgentMessageType.ERROR and self.parse_review_approval(
-                    verdict.content
-                )
-                feedback = (
-                    verdict.content
-                    if verdict.type == AgentMessageType.ERROR
-                    else self.parse_review_issues(verdict.content)
-                )
-                return ReviewResult(
-                    approved=approved,
-                    feedback=feedback,
-                    usage=verdict.usage,
-                    turns=verdict.turns,
-                    error=review_error,
-                )
-
-            self.workflow = WorkflowRunner(
-                tasks=tasks,
-                worker=execute,
-                reviewer=review,
-                max_concurrency=self.worker_count,
-                max_retries=self.max_retries_per_step,
-            )
-            async for event in self.workflow.run():
-                yield event
-            self.total_usage = self.total_usage + self.workflow.total_usage
-            self.total_turns += self.workflow.total_turns
-            self.status = self.workflow.status
-            for step in steps:
-                self._apply_outcome(step, self.workflow.results[step.id])
-            final_text = self.build_final_result(steps)
-            yield {"type": "text_delta", "text": final_text}
-            self.history = [
-                Message(role="user", content=message),
-                Message(role="assistant", content=final_text),
-            ]
-        except Exception as exc:  # noqa: BLE001
-            yield {"type": "error", "error": exc}
-            return
-        finally:
-            with suppress(Exception):
-                snapshot.create("post-turn")
-        done: dict[str, Any] = {
-            "type": "done",
-            "status": self.status,
-            "total_turns": self.total_turns,
-            "total_tokens": self.total_usage.total_tokens,
-            "usage": self.total_usage.to_dict(),
-            "messages": self.history,
-            "task_results": {
-                task_id: asdict(outcome) for task_id, outcome in self.workflow.results.items()
-            },
-        }
-        costs = calculate_costs(self.llm_client, self.total_usage)
-        if costs:
-            done["cost"] = costs
-        yield done
-
-    def parse_plan(self, plan_json: str) -> list[ExecutionStep]:
-        """解析模型计划并统一校验任务编号和依赖，避免无效任务进入调度。"""
-        try:
-            data = _parse_json_object(plan_json)
-            nodes = validate_plan_nodes(data, primary_key="steps", id_prefix="step")
-            id_mapping = {node["id"]: f"step_{index}" for index, node in enumerate(nodes, 1)}
-            return [
-                ExecutionStep(
-                    id=id_mapping[node["id"]],
-                    description=str(node.get("description") or node["id"]),
-                    type=str(node.get("type") or "COMMAND"),
-                    dependencies=[id_mapping[dep] for dep in node["dependencies"]],
-                    mode=_normalize_worker_mode(
-                        str(
-                            node.get("mode")
-                            or (
-                                AgentRunMode.PLAN.value
-                                if str(node.get("type") or "").upper() == "PLAN"
-                                else self.default_worker_mode
-                            )
-                        )
-                    ),
-                )
-                for node in nodes
-            ]
-        except (json.JSONDecodeError, ValueError):
-            return []
-
-    def parse_review_approval(self, review_content: str | None) -> bool:
-        """从结构化评审中读取明确通过标记；缺失或格式错误时不视为通过。"""
-        if not review_content:
-            return False
-        try:
-            data = _parse_json_object(review_content)
-            return data.get("approved") is True
-        except (json.JSONDecodeError, ValueError):
-            return False
-
-    def parse_review_issues(self, review_content: str | None) -> str:
-        if not review_content:
-            return ""
-        try:
-            data = _parse_json_object(review_content)
-        except (json.JSONDecodeError, ValueError):
-            return "review rejected the result"
-        for key in ("issues", "suggestions"):
-            value = data.get(key)
-            if isinstance(value, list) and value:
-                return "\n".join(f"- {item}" for item in value)
-        return str(data.get("summary") or "review rejected the result")
-
-    def summarize_steps(self, steps: list[ExecutionStep]) -> str:
-        lines = ["Execution plan:"]
-        for step in steps:
-            deps = ", ".join(step.dependencies) if step.dependencies else "none"
-            lines.append(
-                f"- [{step.id}] {step.description} ({step.type}, mode: {step.mode}, deps: {deps})"
-            )
-        return "\n".join(lines)
-
-    def build_final_result(self, steps: list[ExecutionStep]) -> str:
-        all_completed = all(step.status == StepStatus.COMPLETED for step in steps)
-        failed = any(
-            step.status in {StepStatus.FAILED, StepStatus.BUDGET_EXHAUSTED} for step in steps
-        )
-        if all_completed:
-            header = "Multi-Agent task completed."
-        elif failed:
-            header = "Multi-Agent task did not fully complete; failed steps remain."
-        else:
-            header = "Multi-Agent task partially completed; pending steps remain."
-        lines = [header, "", "Execution summary:"]
-        intermediate_ids = {dep for step in steps for dep in step.dependencies}
-        for step in steps:
-            icon = {
-                StepStatus.COMPLETED: "COMPLETED",
-                StepStatus.FAILED: "FAILED",
-                StepStatus.PENDING: "PENDING",
-                StepStatus.RUNNING: "RUNNING",
-                StepStatus.SKIPPED: "SKIPPED",
-                StepStatus.BUDGET_EXHAUSTED: "BUDGET_EXHAUSTED",
-            }[step.status]
-            lines.append(f"- [{step.id}] {icon}: {step.description}")
-            if step.result:
-                result = _preview(step.result) if step.id in intermediate_ids else step.result
-                lines.append(f"  Result: {result}")
-        return "\n".join(lines) + "\n"
-
-    @staticmethod
-    def _apply_outcome(step: ExecutionStep, outcome: TaskOutcome) -> None:
-        step.status = {
-            "completed": StepStatus.COMPLETED,
-            "failed": StepStatus.FAILED,
-            "blocked": StepStatus.SKIPPED,
-            "budget_exhausted": StepStatus.BUDGET_EXHAUSTED,
-        }[outcome.status]
-        step.result = outcome.text
-        if outcome.error:
-            step.result = f"{step.result}\n{outcome.error}".strip()
-
-    def _subagent(
-        self,
-        name: str,
-        role: AgentRole,
-        *,
-        tool_registry: ToolRegistry | None = None,
-        event_callback: Callable[[dict[str, Any]], None] | None = None,
-    ) -> SubAgent:
-        """按角色和只读要求创建独立子 Agent，并限制嵌套执行可见的工具。"""
-        return SubAgent(
-            name=name,
-            role=role,
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry if tool_registry is None else tool_registry,
-            config=self.config,
-            cwd=self.cwd,
-            approval_callback=self.approval_callback,
-            skill_context_buffer=SkillContextBuffer(),
-            default_mode=self.default_worker_mode,
-            event_callback=event_callback,
-        )
-
-
-def _parse_json_object(text: str) -> dict[str, Any]:
-    cleaned = re.sub(r"```(?:json)?\s*", "", text or "").replace("```", "").strip()
-    if not cleaned:
-        raise ValueError("empty JSON")
-    data = json.loads(cleaned)
-    if not isinstance(data, dict):
-        raise ValueError("JSON root must be an object")
-    return data
-
-
-def _preview(text: str, max_len: int = 160) -> str:
-    value = (text or "").replace("\r\n", "\n").strip()
-    if len(value) <= max_len:
-        return value
-    return value[: max_len - 3] + "..."
-
-
-def _normalize_worker_mode(mode: str) -> str:
-    value = str(mode or AgentRunMode.REACT.value).strip().lower()
-    if value not in {item.value for item in AgentRunMode}:
-        raise ValueError("worker mode must be react or plan")
-    return value
-
-
-def _task_type(value: str) -> TaskType:
-    try:
-        return TaskType(value.upper())
-    except ValueError:
-        # 未知任务与嵌套计划默认独占执行，避免扩大并发写入范围。
-        return TaskType.COMMAND

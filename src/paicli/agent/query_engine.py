@@ -1,23 +1,16 @@
-"""统一查询接口：组装普通、计划、团队和专用调试入口。"""
+"""统一查询接口：组装普通会话和 Team 入口。"""
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
 
 from paicli.agent.agent import Agent
-from paicli.agent.debug import DebugCoordinator
-from paicli.agent.orchestrator import AgentOrchestrator
-from paicli.agent.plan_execute import PlanExecuteAgent
 from paicli.agent.team import TeamCoordinator
 from paicli.config import PaiCliConfig
 from paicli.llm.base import LlmClient
-from paicli.plan.models import ExecutionPlan
 from paicli.prompt import PromptAssembler
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, QueryResult, Usage
-
-PlanApproval = Callable[[ExecutionPlan], bool | Awaitable[bool]]
 
 
 class QueryEngine:
@@ -59,30 +52,16 @@ class QueryEngine:
         async for event in agent.run(message):
             yield event
 
-    async def plan(self, message: str, *, plan_approval: PlanApproval | None = None):
-        """创建 Plan 执行器，透传规划、执行和最终结果事件。"""
-        agent = PlanExecuteAgent(
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry,
-            config=self.config,
-            cwd=self.cwd,
-            approval_callback=self.approval_callback,
-            plan_approval=plan_approval,
-        )
-        async for event in agent.run(message):
-            yield event
-
     async def team(self, message: str, *, worker_mode: str = "react"):
-        """运行协作 Team；嵌套 Plan 的旧入口仍可显式选用。"""
-        coordinator = TeamCoordinator if worker_mode == "react" else AgentOrchestrator
-        options = {} if worker_mode == "react" else {"default_worker_mode": worker_mode}
-        orchestrator = coordinator(
+        """运行协作 Team，Worker 通过各自的工具循环执行。"""
+        if worker_mode != "react":
+            raise ValueError("Team supports only react workers")
+        orchestrator = TeamCoordinator(
             llm_client=self.llm_client,
             tool_registry=self.tool_registry,
             config=self.config,
             cwd=self.cwd,
             approval_callback=self.approval_callback,
-            **options,
         )
         async for event in orchestrator.run(message):
             yield event
@@ -94,57 +73,11 @@ class QueryEngine:
     ) -> QueryResult:
         return await self._complete_from_events(self.ask(message, history))
 
-    async def debug(
-        self,
-        message: str,
-        *,
-        targets: list[str] | None = None,
-        max_attempts: int = 2,
-        timeout: float = 60,
-        resume: str | None = None,
-        max_tokens: int | None = None,
-        max_tools: int | None = None,
-        max_models: int | None = None,
-        use_knowledge: bool = False,
-    ):
-        """创建专用 Debug 编排器，传入固定验收目标、共享预算与恢复选项。"""
-        coordinator = DebugCoordinator(
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry,
-            config=self.config,
-            cwd=self.cwd,
-            approval_callback=self.approval_callback,
-            targets=targets or [],
-            max_attempts=max_attempts,
-            timeout=timeout,
-            max_tokens=max_tokens,
-            max_tools=max_tools,
-            max_models=max_models,
-            use_knowledge=use_knowledge,
-        )
-        async for event in coordinator.run(message, resume=resume):
-            yield event
-
-    async def debug_complete_async(
-        self, message: str, *, targets: list[str] | None = None, **options
-    ) -> QueryResult:
-        return await self._complete_from_events(self.debug(message, targets=targets, **options))
-
-    async def plan_complete_async(
-        self, message: str, *, plan_approval: PlanApproval | None = None
-    ) -> QueryResult:
-        return await self._complete_from_events(self.plan(message, plan_approval=plan_approval))
-
     async def team_complete_async(self, message: str, *, worker_mode: str = "react") -> QueryResult:
         return await self._complete_from_events(self.team(message, worker_mode=worker_mode))
 
     def ask_complete(self, message: str, history: list[Message] | None = None) -> QueryResult:
         return asyncio.run(self.ask_complete_async(message, history))
-
-    def plan_complete(
-        self, message: str, *, plan_approval: PlanApproval | None = None
-    ) -> QueryResult:
-        return asyncio.run(self.plan_complete_async(message, plan_approval=plan_approval))
 
     def team_complete(self, message: str, *, worker_mode: str = "react") -> QueryResult:
         return asyncio.run(self.team_complete_async(message, worker_mode=worker_mode))

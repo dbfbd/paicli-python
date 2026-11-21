@@ -92,8 +92,7 @@ class PromptConfig:
 
 @dataclass(slots=True)
 class PlanConfig:
-    max_concurrent_tasks: int = 5
-    auto_route: bool = False
+    auto_route: bool = True
 
 
 @dataclass(slots=True)
@@ -296,6 +295,11 @@ def _config_to_dict(config: PaiCliConfig) -> dict[str, Any]:
 
 
 def _dict_to_config(data: dict[str, Any]) -> PaiCliConfig:
+    prompt = dict(data.get("prompt", {}))
+    if str(prompt.get("agent_mode", "")).strip().lower() == "plan":
+        prompt["agent_mode"] = "react"
+    plan = dict(data.get("plan", {}))
+    plan.pop("max_concurrent_tasks", None)
     return PaiCliConfig(
         llm=LlmConfig(**data.get("llm", {})),
         render_mode=data.get("render_mode", "inline"),
@@ -303,9 +307,9 @@ def _dict_to_config(data: dict[str, Any]) -> PaiCliConfig:
         mcp=McpConfig(**data.get("mcp", {})),
         memory=MemoryConfig(**data.get("memory", {})),
         policy=PolicyConfig(**data.get("policy", {})),
-        prompt=PromptConfig(**data.get("prompt", {})),
+        prompt=PromptConfig(**prompt),
         features=FeatureConfig(**data.get("features", {})),
-        plan=PlanConfig(**data.get("plan", {})),
+        plan=PlanConfig(**plan),
         team=TeamConfig(**data.get("team", {})),
     )
 

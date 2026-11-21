@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-PaiCLI 是一个终端编程 Agent，提供交互式 CLI 和 Python SDK。进入项目后可以直接提问、让 Agent 阅读代码，或描述需要实现的改动。单会话可以完成日常的阅读、修改与自测，可独立交付的模块也可以交给多个 Worker 并行开发。遇到可复现的 Python 测试失败时，可以指定用例，由 Debug 记录失败基线、修复并运行回归测试。
+PaiCLI 是一个终端编程 Agent，提供交互式 CLI 和 Python SDK。进入项目后可以直接提问、让 Agent 阅读代码，或描述需要实现的改动。主 Agent 会按任务需要调查改动范围、委派可独立交付的模块，或对可复现的 pytest 失败执行隔离修复与回归验收。
 
 **核心技术**：Python、LangGraph、asyncio、Tool Calling、MCP、SQLite/FTS5、FastEmbed（多语 E5）、pytest、HTTPX。
 
@@ -15,12 +15,12 @@ PaiCLI 是一个终端编程 Agent，提供交互式 CLI 和 Python SDK。进入
 
 | 能力 | 实现方式 |
 | --- | --- |
-| 规划与执行 | 调查仓库后生成任务计划，按依赖调度。遇到可核实的阻塞时允许一次局部重规划 |
+| 影响范围调查 | 只读检查 Python 调用方与候选测试，再由路由决定交回主 Agent 或启动 Team |
 | 多 Agent 协作 | 主 Agent 按需委派调查或实现，Worker 在独立 Git worktree 工作。组合检查通过后才交付补丁 |
 | 受控修复 | 主修复 Agent 按需委派只读调查，高风险补丁通过测试后进入独立审核 |
 | 回归验收 | 固定测试和执行条件，检查目标失败用例转为通过，以及原通过用例保持通过 |
 | 可回查证据 | 原始工具输出和测试结果落盘，角色结论关联来源、行号与源码版本 |
-| 长任务控制 | Debug 跨角色共享预算，支持取消、阶段 Checkpoint、文件核对与同编号续作 |
+| 长任务控制 | Debug 跨角色共享预算，保存阶段 Checkpoint，可查询运行状态并申请取消 |
 | 上下文和记忆 | 滑动窗口、提取式历史摘要、按引用回读，以及按项目隔离的 SQLite 记忆 |
 | 项目资料 RAG | 使用本地多语 E5、FTS5/BM25 与 RRF 检索项目规范和排障手册 |
 | 工具接入 | 提供文件、搜索与命令工具，通过 MCP 扩展外部能力 |
@@ -39,18 +39,6 @@ uv run --locked --extra dev paicli doctor
 
 默认使用 DeepSeek。模型与工具选项可通过用户级 `~/.paicli/config.json` 或目标项目的 `.paicli/config.json` 配置。
 
-### 修复一个已有失败的测试
-
-把下面的项目目录、测试文件和故障描述替换为自己的内容。`--tests` 相对于目标项目解析。
-
-```powershell
-uv run --locked --extra dev paicli debug --cwd ../your-project --tests tests/test_example.py -p '修复当前失败用例，保留已有接口和其他通过行为' --json
-```
-
-目标项目中存在 `.venv` 时，Debug 优先使用该环境运行 pytest。请在该环境安装项目依赖和 pytest。可重复传入 `--tests` 指定多个目标。
-
-最终结果包含运行编号、状态、测试验收信息和用量。`completed` 表示通过了本次任务所要求的验收与审核。
-
 ### 进入交互会话
 
 ```powershell
@@ -59,34 +47,33 @@ uv run --locked --extra dev paicli --cwd ../your-project
 
 ```text
 概述这个项目的模块和入口
-/plan 先梳理批量导入的调用路径，再列出改动步骤
+先只读梳理批量导入的调用路径和相关测试，列出改动方案
 /team 并行补齐 CSV 和 JSONL 解析模块，各自运行单测，最后统一验收
-tests/test_example.py 里有失败用例，请先复现再修复
+请复现并修复 tests/test_example.py::test_case，保持 tests/test_example.py 中其他通过的用例
 /help
 ```
 
-`/debug` 使用两侧带空格的 ` :: ` 分隔测试目标和故障描述。
-
-用 `paicli --confirm-plan` 启动交互会话后，`/plan` 会展示计划，并询问是否开始执行。单次请求和 SDK 默认直接执行。SDK 如需确认，可向 `engine.plan(..., plan_approval=callback)` 传入返回布尔值的回调。
-
-Plan 的并发上限默认为 5。可在 `.paicli/config.json` 中设置 `{"plan": {"max_concurrent_tasks": 3}}`。只有依赖已经满足的只读任务可以并行。
+替换示例中的测试文件和用例名称。隔离修复需要目标项目已有 Git 提交。目标项目存在 `.venv` 时，Debug 优先使用该环境，请在其中安装项目依赖和 pytest。修复成功后，工具结果会返回验收情况和运行编号。
 
 ## 执行链路
 
 普通输入和 SDK 的 `ask()` 都由主 Agent 处理。主 Agent 先读代码、确认改动范围，再决定自己执行，还是委派带文件范围和验收条件的子任务。委派后，主 Agent 可以继续处理公共入口或准备集成检查。
 
-`/plan` 适合先搞清依赖再动手的任务。它先调查项目并展示计划，执行时按依赖调度，遇到已核实的阻塞可以局部重规划一次。若要允许主 Agent 按需走规划路径，在 `.paicli/config.json` 中设置 `{"plan": {"auto_route": true}}`。主 Agent 调用 `plan_change` 后，LangGraph 路由会扫描 Python 调用方和候选测试，再决定交回分析结果或启动已准备好的协作组。
+主 Agent 读取到存在共享依赖的 Python 文件后，可以调用 `plan_change`。LangGraph 先执行只读调查，列出可能受影响的文件、导入关系、候选测试和待确认范围，再回到同一个路由节点。如果影响范围已确认，且任务草案包含可独立启动的子任务，路由会启动 Team。其余情况把调查结果交回主 Agent 继续处理。这个入口默认启用，可在项目配置中设置 `{"plan": {"auto_route": false}}` 来关闭。
 
-主 Agent 也可以为已有失败用例发起隔离调试。这条路径会先在独立候选版本上验收修复，再应用通过检查的补丁。
+会话观察到可复现的 pytest 失败后，可以经路由进入 Debug。候选修复先在独立工作区验收，通过后才应用到主工作区。
 
 ```mermaid
 flowchart LR
     Request[CLI / REPL / SDK] --> Lead[主 Agent 与工具循环]
-    Lead --> Work[在原工作区处理公共部分]
-    Lead -->|按需委派| Workers[隔离的 Worker 工作区]
-    Work --> Check[组合候选并按提交检查]
-    Workers --> Check
-    Check -->|按权限应用已验证补丁| Lead
+    Lead -->|按需调查、委派或隔离修复| Route[LangGraph 路由]
+    Route -->|需要调查| Inspect[Plan 只读影响调查]
+    Inspect -->|提交调查结果| Route
+    Route -->|交回调查结果| Lead
+    Route -->|分工明确| Team[Team 并行开发与组合验收]
+    Route -->|确认测试失败| Debug[Debug 隔离修复与回归验收]
+    Team -->|返回协作结果| Lead
+    Debug -->|返回修复结果| Lead
 ```
 
 ### Team 并行开发
@@ -120,19 +107,17 @@ Harness 在工具执行层限制权限与写入范围。Debug 允许修改项目
 
 独立 pytest Verifier 检查目标失败用例是否转为通过（F2P），以及基线中已通过的用例是否保持通过（P2P）。失败信息或审核意见会送回修复会话。连续返修根据补丁、失败用例和源码证据检测停滞，先收敛到主修复 Agent，仍无进展则结束。
 
-### 预算、取消与阶段恢复
+### 预算、证据与取消
 
 ```powershell
-uv run --locked --extra dev paicli debug --cwd ../your-project --tests tests/test_example.py -p '描述故障' --max-models 24 --max-tools 48 --max-tokens 160000
 uv run --locked --extra dev paicli runs list
 uv run --locked --extra dev paicli runs show RUN_ID
 uv run --locked --extra dev paicli runs cancel RUN_ID
-uv run --locked --extra dev paicli debug --resume RUN_ID
 ```
 
-将 `RUN_ID` 替换为实际运行编号。Checkpoint 保存已完成阶段、消息历史、文件信息和证据引用。恢复时核对工作区，沿用原目标、验收与累计用量。可在恢复命令上增加 `--max-models 40` 等选项显式提高预算。
+将 `RUN_ID` 替换为实际运行编号。阶段 Checkpoint 记录进度、累计用量、文件版本和证据引用，可结合运行记录追查复现、返修和验收过程。
 
-预算在新增请求前检查，最后一个在途请求的实际用量可能超过门槛。调查超时可交回已有证据，补丁通过测试但必要审核未完成时，会保留为待审核状态供续作。
+预算在新增请求前检查，最后一个在途请求的实际用量可能超过门槛。调查超时可交回已有证据，必要审核完成后才会应用补丁。
 
 ### 单独使用测试验收
 
@@ -153,12 +138,11 @@ uv run --locked --extra dev paicli verify check BASELINE_RUN_ID --json
 uv sync --locked --extra dev --extra retrieval
 uv run --locked --extra dev --extra retrieval paicli knowledge index docs --cwd ../your-project
 uv run --locked --extra dev --extra retrieval paicli knowledge search '重复请求如何处理' --cwd ../your-project --k 3
-uv run --locked --extra dev --extra retrieval paicli debug --cwd ../your-project --tests tests/test_example.py -p '描述故障' --knowledge
 ```
 
 `docs` 应替换为项目内的 Markdown、TXT、RST 文件或目录。首次建索引下载本地多语 E5 模型。检索经 RRF 融合后返回路径、行号和文件哈希，过滤已变化的来源。文档更新后重新运行建索引命令。
 
-Debug 在故障复现后按需检索资料，角色共享这组引用。源码通过文件工具即时读取，修复结果由测试验收。索引缺失或检索不可用时，程序记录状态并继续调试。
+找到相关资料后，可以把路径和行号带入开发任务，供 Agent 读取和核对。
 
 ## 上下文、记忆与工具
 
@@ -189,24 +173,24 @@ async def main():
 asyncio.run(main())
 ```
 
-`engine.plan()`、`engine.team()` 和 `engine.debug()` 提供异步事件流，可消费任务进度、工具执行和最终状态。
+`engine.ask()` 和 `engine.team()` 提供异步事件流，可消费任务进度、工具执行和最终状态。普通任务使用 `ask()`，其中的主 Agent 会按需进入 Plan 或 Debug。
 
 ## 可选 Runtime 服务
 
-通用 ReAct、Plan、Team 任务可通过 HTTP Runtime 提交，由 SQLite 持久化队列处理。
+普通任务和显式 Team 任务均可通过 HTTP Runtime 提交，由 SQLite 持久化队列处理。
 
 ```powershell
 $env:PAICLI_RUNTIME_API_KEY = 'your-runtime-key'
 uv run --locked --extra dev paicli serve --cwd ../your-project --port 8080
 ```
 
-服务提供 `/v1/threads` 与 `/v1/tasks` 等入口，请求使用 Bearer 鉴权。也可单独启动 `paicli worker --cwd ../your-project --workers 2`。Debug 的测试目标、预算和阶段恢复通过专用 CLI/SDK 配置。
+服务提供 `/v1/threads` 与 `/v1/tasks` 等入口，请求使用 Bearer 鉴权。也可单独启动 `paicli worker --cwd ../your-project --workers 2`。升级前已排队的 Plan 任务由普通入口继续处理。
 
 ## 项目结构
 
 ```text
 src/paicli/
-├── agent/         查询循环、Plan/Team 调度与 Debug 状态图
+├── agent/         查询循环、自动路由、Team 调度与 Debug 状态图
 ├── harness/       任务契约、证据、pytest 验收与运行控制
 ├── context/       请求预算、滑动窗口与历史摘要
 ├── memory/        持久记忆与召回缓存
@@ -221,7 +205,6 @@ src/paicli/
 ## 适用范围
 
 - Debug 面向存在可复现 pytest 失败的本地 Python 项目，覆盖取决于指定目标和关联测试范围。
-- 恢复以已完成业务阶段为边界，要求源码与验收条件匹配。终结状态或不兼容流程版本需要重新发起任务。
 - 资料检索面向小型本地语料，向量保存在 SQLite 并做有界精确检索。
 - 程序级权限、预算与证据检查按具体入口生效，Debug 的专门约束由协调器和 Harness 实施。
 

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-TASK_MODES = {"react", "plan", "team"}
+TASK_MODES = {"react", "team"}
 TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 
 

@@ -120,10 +120,11 @@ class SpecializedWorkflows:
                 registry.register(
                     Tool(
                         "plan_change",
-                        "Before a coupled Python change, inspect affected callers and tests. "
+                        "Run a read-only investigation of a coupled Python change and return "
+                        "affected callers, test candidates, and unread sources to the router. "
                         "Pass the files that define the contract to change. "
                         "For an authorized implementation with a ready, independent split, "
-                        "optionally include a Team draft to start if the scan finds no gaps.",
+                        "optionally include a Team draft for the router to validate after the scan.",
                         object_schema(
                             {"paths": _PATHS, "team": DELEGATION_SCHEMA}, ["paths"]
                         ),
@@ -398,6 +399,7 @@ async def _select_route(state: _RouteState, runtime: Runtime[_RouteContext]) -> 
     analysis = state["analysis"]
     proposal = context.arguments.get("team")
     if proposal is None:
+        _route_record("workflow.routed", workflow="plan", destination="lead")
         return {"next_step": "lead", "result": ToolResult(analysis.text)}
     try:
         team = workflows.collaboration

@@ -11,7 +11,6 @@ from contextlib import aclosing, suppress
 from typing import Any, Literal
 
 from paicli.agent.collaboration import Collaboration, LEAD_INSTRUCTIONS
-from paicli.agent.plan_execute import PlanExecuteAgent
 from paicli.agent.query import query as _query
 from paicli.agent.specialized import SpecializedWorkflows
 from paicli.config import PaiCliConfig
@@ -24,14 +23,13 @@ from paicli.snapshot import SnapshotService
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, QueryResult, Usage
 
-AgentMode = Literal["react", "plan", "team"]
+AgentMode = Literal["react", "team"]
 
 
 class Agent:
     """维护一个 Agent 会话，并连接模型、工具与运行配置。
 
-    普通输入复用 query 循环，由主 Agent 自行处理或委派。显式 Plan 和 Team
-    入口供原来使用这些运行方式的调用方继续使用。
+    普通输入复用 query 循环，由主 Agent 自行处理或按需路由。Team 可以显式启动。
     对象保留历史，调用方可复用实例继续对话。
     """
 
@@ -52,6 +50,8 @@ class Agent:
         self.config = config
         self.cwd = cwd
         self.approval_callback = approval_callback
+        if mode not in {"react", "team"}:
+            raise ValueError("mode must be react or team")
         self.mode = mode
         self.max_turns = max_turns
 
@@ -88,12 +88,10 @@ class Agent:
 
         text_delta/thinking_delta 表示文字片段，tool_call/tool_result 表示工具过程，
         usage 表示本轮用量，done 汇总执行状态、历史与统计。
-        普通模式在执行前后创建快照；Plan 和 Team 在各自路径管理快照。
+        普通模式在执行前后创建快照，Team 在自己的路径管理工作区。
         """
-        # Plan 和 Team 在各自路径管理快照；此处只为普通模式创建快照。
-        if self.mode in {"plan", "team"}:
-            runner = self._run_plan if self.mode == "plan" else self._run_team
-            async for event in runner(message):
+        if self.mode == "team":
+            async for event in self._run_team(message):
                 yield event
             return
 
@@ -196,25 +194,6 @@ class Agent:
                     yield event
         finally:
             await collaboration.close()
-
-    async def _run_plan(self, message: str) -> AsyncIterator[dict[str, Any]]:
-        """交给 Plan 编排器生成并执行任务图，再接收其历史和统计。"""
-        agent = PlanExecuteAgent(
-            llm_client=self.llm_client,
-            tool_registry=self.tool_registry,
-            config=self.config,
-            cwd=self.cwd,
-            approval_callback=self.approval_callback,
-            max_task_turns=self.max_turns,
-        )
-        agent.history = list(self.history)
-
-        async for event in agent.run(message):
-            if event.get("type") == "done":
-                self.history = list(event.get("messages") or [])
-                self.last_usage = Usage.from_mapping(event.get("usage") or {})
-                self.last_cost = dict(event.get("cost") or {})
-            yield event
 
     async def _run_team(self, message: str) -> AsyncIterator[dict[str, Any]]:
         """交给多 Agent 编排器执行任务，再接收其历史和统计。"""

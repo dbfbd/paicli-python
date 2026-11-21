@@ -21,12 +21,10 @@ from paicli.entrypoints.knowledge import knowledge_app
 from paicli.entrypoints.repl import start_repl
 from paicli.entrypoints.runs import runs_app
 from paicli.entrypoints.verification import verify_app
-from paicli.harness.evidence import load_run
 from paicli.llm import create_llm_client
 from paicli.mcp import load_mcp_server_specs, serve_http, serve_stdio, write_chrome_devtools_config
 from paicli.runtime import RuntimeApiServer
 from paicli.runtime.api import runtime_api_key
-from paicli.tools import ToolRegistry, get_builtin_tools
 
 app = typer.Typer(
     name="paicli",
@@ -81,16 +79,12 @@ def main(
     # Agent 执行模式
     mode: Annotated[
         str | None,
-        typer.Option("--mode", help="Agent mode: react, plan, or team"),
+        typer.Option("--mode", help="Agent mode: react or team"),
     ] = None,
     worker_mode: Annotated[
         str,
-        typer.Option("--worker-mode", help="Sub-Agent worker mode in team runs: react or plan"),
+        typer.Option("--worker-mode", hidden=True),
     ] = "react",
-    confirm_plan: Annotated[
-        bool,
-        typer.Option("--confirm-plan", help="Ask before executing /plan in interactive mode"),
-    ] = False,
     # 输出格式
     json_output: Annotated[
         bool,
@@ -109,15 +103,11 @@ def main(
 ) -> None:
     """在指定工作目录运行终端 Agent。
 
-    默认进入交互模式；使用 -p 执行单次任务，也可通过子命令调试、验收或启动服务。
+    默认进入交互模式。使用 -p 执行单次任务，或通过子命令管理验收和运行服务。
     """
     _ = version
     if ctx.invoked_subcommand is not None:
         return
-    if confirm_plan and prompt is not None:
-        raise typer.BadParameter(
-            "requires an interactive session without --prompt", param_hint="--confirm-plan"
-        )
 
     root = (cwd or Path.cwd()).resolve()
 
@@ -141,14 +131,12 @@ def main(
     if plain:
         config.render_mode = "plain"
 
+    selected_mode = (mode or config.prompt.agent_mode or "react").lower()
+    if selected_mode not in {"react", "team"}:
+        raise typer.BadParameter("mode must be react or team", param_hint="--mode")
+    if worker_mode != "react":
+        raise typer.BadParameter("Team supports only react workers", param_hint="--worker-mode")
     if prompt is not None:
-        selected_mode = (mode or config.prompt.agent_mode or "react").lower()
-        if selected_mode not in {"react", "plan", "team"}:
-            raise typer.BadParameter("mode must be react, plan, or team", param_hint="--mode")
-        if worker_mode not in {"react", "plan"}:
-            raise typer.BadParameter(
-                "worker-mode must be react or plan", param_hint="--worker-mode"
-            )
         asyncio.run(
             _run_prompt(
                 prompt,
@@ -160,89 +148,12 @@ def main(
             )
         )
     else:
-        asyncio.run(start_repl(str(root), config, confirm_plan=confirm_plan))
+        asyncio.run(start_repl(str(root), config))
 
 
 # ---------------------------------------------------------------------------
 # 子命令
 # ---------------------------------------------------------------------------
-
-
-@app.command("debug")
-def debug_command(
-    prompt: Annotated[str, typer.Option("-p", "--prompt", help="Bug and intended behavior")] = "",
-    tests: Annotated[
-        list[str] | None, typer.Option("--tests", help="Existing pytest target; repeatable")
-    ] = None,
-    cwd: Annotated[Path | None, typer.Option("--cwd", help="Target Python project")] = None,
-    max_attempts: Annotated[int, typer.Option("--max-attempts", min=1, max=5)] = 2,
-    timeout: Annotated[float, typer.Option("--timeout", min=0.001, max=3600)] = 60,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
-    resume: Annotated[str | None, typer.Option("--resume", help="Continue a debug run ID")] = None,
-    max_tokens: Annotated[int | None, typer.Option("--max-tokens", min=1)] = None,
-    max_tools: Annotated[int | None, typer.Option("--max-tools", min=1)] = None,
-    max_models: Annotated[int | None, typer.Option("--max-models", min=1)] = None,
-    knowledge: Annotated[
-        bool, typer.Option("--knowledge", help="Retrieve indexed project reference docs")
-    ] = False,
-) -> None:
-    """执行带独立 pytest 验收的调试任务，支持按需角色协作及阶段恢复。"""
-    try:
-        if not resume and (not prompt.strip() or not tests):
-            raise ValueError("Provide --prompt and --tests, or --resume RUN_ID")
-        if resume and tests:
-            raise ValueError("Resume reuses the original tests; do not pass --tests")
-        root = (cwd or (Path(load_run(resume).manifest["cwd"]) if resume else Path.cwd())).resolve()
-        config = load_config(project_root=root)
-        if not config.llm.api_key:
-            raise ValueError("Debug requires the configured model API key")
-        result = asyncio.run(
-            _run_debug(
-                prompt,
-                root,
-                config,
-                tests or [],
-                max_attempts,
-                timeout,
-                resume=resume,
-                max_tokens=max_tokens,
-                max_tools=max_tools,
-                max_models=max_models,
-                use_knowledge=knowledge,
-            )
-        )
-    except KeyboardInterrupt:
-        typer.echo("Debug cancelled. Use `paicli runs list` to find its checkpoint.", err=True)
-        raise typer.Exit(130) from None
-    except (OSError, ValueError, RuntimeError) as exc:
-        typer.echo(f"Debug error: {exc}", err=True)
-        raise typer.Exit(2) from exc
-    typer.echo(json.dumps(result, ensure_ascii=False) if json_output else result["text"])
-    if result.get("status") != "completed":
-        raise typer.Exit(1)
-
-
-async def _run_debug(prompt, root, config, tests, max_attempts, timeout, **options) -> dict:
-    """组装调试引擎，消费事件并收集最终状态，供命令行展示与退出码判断。"""
-    registry = ToolRegistry()
-    registry.register_all(get_builtin_tools())
-    engine = QueryEngine(
-        llm_client=create_llm_client(config.llm),
-        tool_registry=registry,
-        config=config,
-        cwd=str(root),
-    )
-    text, result = "", {"status": "failed"}
-    async for event in engine.debug(
-        prompt, targets=tests, max_attempts=max_attempts, timeout=timeout, **options
-    ):
-        if event["type"] == "debug_started":
-            typer.echo(f"Debug run: {event['run_id']}", err=True)
-        elif event["type"] == "text_delta":
-            text += event["text"]
-        elif event["type"] == "done":
-            result = {key: value for key, value in event.items() if key != "messages"}
-    return {**result, "text": text}
 
 
 @app.command("doctor")
@@ -408,9 +319,7 @@ async def _run_prompt(
         cwd=cwd,
     )
     try:
-        if mode == "plan":
-            result = await engine.plan_complete_async(prompt)
-        elif mode == "team":
+        if mode == "team":
             result = await engine.team_complete_async(prompt, worker_mode=worker_mode)
         else:
             result = await engine.ask_complete_async(prompt)

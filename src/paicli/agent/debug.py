@@ -6,6 +6,7 @@ import ast
 import asyncio
 import difflib
 import json
+import re
 from collections import Counter
 from contextlib import contextmanager, suppress
 from dataclasses import asdict, replace
@@ -15,13 +16,7 @@ from typing import TypedDict
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
-from paicli.agent.orchestrator import (
-    AgentMessage,
-    AgentMessageType,
-    AgentRole,
-    SubAgent,
-    _parse_json_object,
-)
+from paicli.agent.orchestrator import AgentMessage, AgentMessageType, AgentRole, SubAgent
 from paicli.harness.contracts import (
     INTERNAL_DIRS,
     EvidenceBook,
@@ -41,6 +36,16 @@ from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, Usage
 
 _READ_TOOLS = {"read_file", "read_evidence", "grep_code", "glob_files"}
+
+
+def _parse_json_object(text: str) -> dict:
+    cleaned = re.sub(r"```(?:json)?\s*", "", text or "").replace("```", "").strip()
+    if not cleaned:
+        raise ValueError("empty JSON")
+    data = json.loads(cleaned)
+    if not isinstance(data, dict):
+        raise ValueError("JSON root must be an object")
+    return data
 
 
 def is_application_source(path: Path) -> bool:

@@ -415,8 +415,7 @@ def _validate_mode(mode: str) -> str:
 
 
 def _engine_events(engine: QueryEngine, mode: str, message: str, *, history=None):
-    if mode == "plan":
-        return engine.plan(message)
     if mode == "team":
         return engine.team(message)
+    # 已经入队的旧 Plan 任务也通过普通会话路由。
     return engine.ask(message, history=history)
