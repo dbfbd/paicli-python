@@ -30,8 +30,9 @@ class SnapshotRecord:
 
 
 class SnapshotService:
-    def __init__(self, project_root: str | Path):
+    def __init__(self, project_root: str | Path, *, max_snapshots: int = 20):
         self.project_root = Path(project_root).resolve()
+        self.max_snapshots = max(1, int(max_snapshots))
         digest = hashlib.sha256(str(self.project_root).encode("utf-8")).hexdigest()[:16]
         self.root = Path.home() / ".paicli" / "snapshots" / digest
         self.root.mkdir(parents=True, exist_ok=True)
@@ -61,7 +62,28 @@ class SnapshotService:
                 )
                 + "\n"
             )
+        self._prune()
         return record
+
+    def _prune(self) -> None:
+        """保留最近 max_snapshots 份快照，自动回收历史目录避免磁盘无限增长。"""
+        if not self.index_path.exists():
+            return
+        lines = [
+            line for line in self.index_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        if len(lines) <= self.max_snapshots:
+            return
+        expired, kept = lines[: len(lines) - self.max_snapshots], lines[-self.max_snapshots :]
+        for raw in expired:
+            try:
+                item = json.loads(raw)
+                old_path = Path(item["path"]).resolve()
+                if old_path.parent == self.root.resolve() and old_path.exists():
+                    shutil.rmtree(old_path, ignore_errors=True)
+            except (OSError, ValueError, KeyError):
+                continue
+        self.index_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
 
     def list(self, limit: int = 20) -> list[SnapshotRecord]:
         if not self.index_path.exists():

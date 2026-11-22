@@ -59,7 +59,7 @@ class TeamRequirement:
     accepted: bool = False
 
 
-def parse_team_plan(text: str) -> TeamPlan:
+def parse_team_plan(text: str, *, allow_empty_checks: bool = False) -> TeamPlan:
     """把队长的结构化输出校验成可调度任务和检查项。"""
     raw = text.strip()
     if raw.startswith("```") and raw.endswith("```"):
@@ -127,7 +127,7 @@ def parse_team_plan(text: str) -> TeamPlan:
     for check in checks:
         if check.owner and check.owner not in known:
             raise ValueError(f"Check {check.id} has unknown task owner {check.owner}")
-    if owners and not checks:
+    if owners and not checks and not allow_empty_checks:
         raise ValueError(
             "A Team plan with writable tasks needs at least one runnable check"
         )
@@ -262,9 +262,6 @@ class TeamBoard:
                 commit, summary, current.version + 1 if current else 1
             )
             self.publications[task_id] = publication
-            for request_id, requirement in self.requirements.items():
-                if requirement.owner == task_id and requirement.accepted:
-                    self.requirements[request_id] = replace(requirement, accepted=False)
             return publication
 
     def finish(self, task_id: str) -> None:
@@ -371,11 +368,7 @@ class TeamBoard:
             return tuple(
                 item
                 for item in self.requirements.values()
-                if item.check is None
-                and (
-                    not item.accepted
-                    or item.response_version != self._publication_version(item.owner)
-                )
+                if item.check is None and not item.accepted
             )
 
     def _publication_version(self, task_id: str) -> int:

@@ -12,6 +12,7 @@ from typing import Any
 
 from paicli.agent.team import TeamCoordinator, _TeamBudget, _TeamRun
 from paicli.agent.team_board import (
+    TeamCheck,
     TeamPlan,
     normalize_team_path,
     parse_team_check,
@@ -26,27 +27,29 @@ from paicli.tools.file_ops import resolve_path
 from paicli.tools.registry import ToolRegistry
 
 LEAD_INSTRUCTIONS = """
-Lead the user's task from start to finish. Read the relevant entry points or reproduce a failure
-when needed. Handle focused work and tightly coupled edits yourself. Make a short plan in this
-same conversation when the work needs one. Respect requests for a read-only plan or approval
-before editing. Ask a focused question only for a blocking decision.
-Use delegate_work when an independent investigation or verification is substantial, or when
-distinct implementation tasks can progress in parallel with known interfaces and checks.
-Provide actionable goals, exact repository-relative writable files and only real dependencies.
-Prefer existing tests and short checks derived from the user's requirements. For cross-module
-implementation, include a check of the integrated behavior and omit its owner when it needs
-your files or multiple tasks. Give a Worker only the checks it can run with its own files and
-declared dependencies. Shared files and public interfaces belong to one writer, often you.
-In lead_paths list only untracked files created outside the normal file tools that must be
-included in the candidate. Workers start in the background. Use the time to handle work you own.
-Call collect_work after your integration-side edits are ready. It checks exactly the combined
-version and returns evidence. If a check you wrote contradicts the requirements, correct it
-with collect_work's correct_checks and give the exact reason. Do not weaken user-supplied checks.
-Re-collect after fixing your own files; the group can keep its completed Worker results.
-For an authorized implementation request, use apply_work to adopt the verified changes, then
-report what was actually verified. If a group cannot succeed, discard it and take over.
-Never claim that pending tasks or an unapplied patch changed the checkout.
-Review-only requests stay read-only.
+Lead the user's task from start to finish.
+1. Fast orientation: On multi-file Python repos, call `code_map` early to see symbols, signatures,
+   import edges, and candidate tests in one step instead of reading files serially.
+2. Parallel read-only audit/research: When investigating or auditing 2–4 independent subsystems or
+   filesets, prefer calling `explore` with 1 question per subsystem so they run concurrently without
+   bloating your main context.
+3. Parallel multi-module implementation (`delegate_work`):
+   - Handle single-file fixes or tightly coupled 1–2 file edits directly yourself.
+   - Whenever a task requires implementing or migrating **2 or more independent files/modules** with
+     clear contracts (e.g., multiple parsers, adapters, channels, handlers, or validators), **prefer
+     `delegate_work`** to build those modules in parallel Git worktrees while you handle the shared
+     entrypoint/registry/dispatcher file in the foreground!
+   - Put key shared data models, function signatures, and edge-case rules in `shared_context` so
+     every Worker starts immediately without cold-reading the whole repository.
+   - Give each Worker exact repository-relative writable `paths` (non-overlapping). `checks` is
+     optional: omit it for automatic pytest/compile verification, or supply concise per-owner and
+     integration checks.
+   - Call `collect_work` once your own integration edits are ready; if checks fail, fix your files
+     or let Workers repair on recheck, or adjust your own check via `correct_checks`.
+   - Call `apply_work` after `collect_work` succeeds, then report verified results. If a group cannot
+     succeed, discard it (`collect_work(discard=true)`) and finish cleanly yourself.
+4. Discipline: Respect read-only requests (never write files). Ask clarifying questions only when
+   truly blocked. Never claim tests passed or files changed unless actually executed and applied.
 """.strip()
 
 _STRING = {"type": "string"}
@@ -82,6 +85,13 @@ _CHECK = object_schema(
 DELEGATION_SCHEMA = object_schema(
     {
         "goal": _STRING,
+        "shared_context": {
+            "type": "string",
+            "description": (
+                "Concise shared contracts, data types, signatures, and test requirements injected "
+                "identically to all Workers so they avoid cold re-reading and share KV prefix cache."
+            ),
+        },
         "tasks": {"type": "array", "items": _TASK},
         "checks": {"type": "array", "items": _CHECK},
         "lead_paths": _STRINGS,
@@ -93,10 +103,20 @@ DELEGATION_SCHEMA = object_schema(
 class Collaboration:
     """一轮主会话可以按需启动、收取和应用多个先后执行的任务组。"""
 
-    def __init__(self, *, llm_client, registry, config, cwd, approval_callback):
+    def __init__(
+        self,
+        *,
+        llm_client,
+        registry,
+        config,
+        cwd,
+        approval_callback,
+        event_sink: Callable[[dict[str, Any]], None] | None = None,
+    ):
         self._approver = approval_callback
         self._approval_lock = asyncio.Lock()
         self.approval = self._approve if approval_callback is not None else None
+        self._event_sink = event_sink
         self.coordinator = TeamCoordinator(
             llm_client=llm_client,
             tool_registry=registry,
@@ -121,6 +141,10 @@ class Collaboration:
         self.group = 0
         self.deadline = 0.0
 
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self._event_sink is not None and event.get("type") == "team_status":
+            self._event_sink(event)
+
     async def _approve(self, request):
         async with self._approval_lock:
             result = self._approver(request)
@@ -137,8 +161,9 @@ class Collaboration:
             [
                 Tool(
                     "delegate_work",
-                    "Start scoped work in the background. Tasks use exact Git-root-relative paths;"
-                    " an empty paths list means read-only. Include checks for any write delegation.",
+                    "Start scoped parallel Workers in isolated Git worktrees. Provide shared_context "
+                    "with key contracts/types and exact Git-root-relative paths per task (empty paths "
+                    "means read-only). `checks` is optional (auto-inferred from tests/ when omitted).",
                     DELEGATION_SCHEMA,
                     self.start,
                     is_concurrency_safe=False,
@@ -233,8 +258,14 @@ class Collaboration:
         if not isinstance(goal, str) or not goal.strip():
             return ToolResult("请提供清楚的协作目标", is_error=True)
         if plan is None:
-            plan = parse_team_plan(json.dumps(data, ensure_ascii=False))
+            plan = parse_team_plan(
+                json.dumps(data, ensure_ascii=False),
+                allow_empty_checks=True,
+            )
         paths = tuple(path for task in plan.tasks for path in task.paths)
+        if paths and not plan.checks:
+            plan = replace(plan, checks=self._infer_default_checks(paths))
+        shared_context = str(data.get("shared_context") or "").strip()[:8_000]
         if (
             paths
             and self.approval is None
@@ -276,7 +307,12 @@ class Collaboration:
             1.0, self.coordinator.config.team.timeout
         )
         flow = self.flow = _TeamRun(
-            self.coordinator, goal.strip(), workspace, self.budget, lambda _event: None
+            self.coordinator,
+            goal.strip(),
+            workspace,
+            self.budget,
+            self._emit,
+            shared_context=shared_context,
         )
         self._record(
             "collaboration.started",
@@ -366,7 +402,40 @@ class Collaboration:
         if corrections:
             self._correct_failed_checks(corrections, data.get("reason"))
         self.source, self.integration_revision = source, revision
-        return await self._bounded(lambda: self.flow.verify(self._integration_base))
+        self.deadline = asyncio.get_running_loop().time() + max(
+            1.0, self.coordinator.config.team.timeout
+        )
+        return await self._bounded(
+            lambda: self.flow.verify(self._integration_base, repair_workers=True)
+        )
+
+    def _infer_default_checks(self, paths: tuple[str, ...]) -> tuple[TeamCheck, ...]:
+        """当主 Agent 省略 checks 时自动推断默认验证，降低并行委派门槛。"""
+        root = Path(self.coordinator.cwd).resolve()
+        if (root / "tests").is_dir() or any(root.glob("test_*.py")):
+            return (
+                TeamCheck(
+                    id="auto_pytest",
+                    argv=("python", "-m", "pytest", "-q"),
+                    expected_exit=0,
+                ),
+            )
+        py_files = [p for p in paths if p.endswith(".py")]
+        if py_files:
+            return (
+                TeamCheck(
+                    id="auto_compile",
+                    argv=("python", "-m", "py_compile", *py_files[:12]),
+                    expected_exit=0,
+                ),
+            )
+        return (
+            TeamCheck(
+                id="auto_noop",
+                argv=("python", "-c", "print('ok')"),
+                expected_exit=0,
+            ),
+        )
 
     def _correct_failed_checks(self, corrections, reason) -> None:
         assert self.flow is not None

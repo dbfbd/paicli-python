@@ -65,6 +65,7 @@ class RunControl:
             self.data["unreported_calls"] += 1
             self.data["unreported_token_reserve"] += pending
         self.data["pending"].clear()
+        self._in_flight_est: dict[str, int] = {}
         self.expected = self.fingerprints()
         self.run.record("execution.opened", limits=self.data["limits"])
 
@@ -120,22 +121,35 @@ class RunControl:
         self.run.record("budget.tool", used=self.data["tools"])
 
     def begin_model(self, client, messages, tools, system_prompt):
-        """派发前检查共享阈值并预留未报告用量；最终一次请求仍可能越过 token 阈值。"""
+        """派发前检查共享阈值并预留未报告用量与在途并发估算；避免并发调查同时越过共享预算。"""
         self.check_cancel()
         if self.stop:
             raise self.stop
         if reason := self.model_budget_reason():
             self.halt("budget_exhausted", reason)
-        # 字节数加输出上限仅用于保守预留；真实用量以服务方报告为准。
+        # 字节数加输出上限仅用于崩溃未报告时的保守兜底；在途并发按估算值实时扣减 remaining_tokens。
         payload = json.dumps(
             [system_prompt, [asdict(m) for m in messages], tools], ensure_ascii=False
         )
-        reservation = len(payload.encode("utf-8")) + int(getattr(client, "max_tokens", 8192))
+        payload_bytes = len(payload.encode("utf-8"))
+        max_out = int(getattr(client, "max_tokens", 8192))
+        reservation = payload_bytes + max_out
+        in_flight_est = max(1, payload_bytes // 3) + min(max_out, 2048)
         ticket = uuid4().hex
         self.data["models"] += 1
         self.data["pending"][ticket] = reservation
-        self.run.record("budget.model_started", request=ticket, reserved_if_unreported=reservation)
+        self._in_flight_est[ticket] = in_flight_est
+        self.run.record(
+            "budget.model_started",
+            request=ticket,
+            reserved_if_unreported=reservation,
+            in_flight_est=in_flight_est,
+        )
         return ticket
+
+    @property
+    def in_flight_tokens(self) -> int:
+        return sum(self._in_flight_est.values())
 
     @property
     def remaining_tokens(self):
@@ -143,6 +157,7 @@ class RunControl:
             self.data["limits"]["tokens"]
             - self.usage.total_tokens
             - self.data["unreported_token_reserve"]
+            - self.in_flight_tokens
         )
 
     @property
@@ -157,8 +172,9 @@ class RunControl:
         return ""
 
     def end_model(self, ticket, usage, reported):
-        """回收请求登记并累计官方用量；缺少用量报告时保守计入预留值。"""
+        """回收请求登记与在途预留并累计官方用量；缺少用量报告时保守计入预留值。"""
         reservation = self.data["pending"].pop(ticket)
+        self._in_flight_est.pop(ticket, None)
         self.data["usage"] = (self.usage + usage).to_dict()
         if not reported:
             self.data["unreported_calls"] += 1

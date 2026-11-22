@@ -17,10 +17,14 @@ class ContextBudget:
     compression_threshold: float = 0.8
     compression_target: float = 0.55
     reserve_tokens: int = 1024
+    max_input_tokens_cap: int | None = None
 
     @property
     def available_input_tokens(self) -> int:
-        return max(256, self.context_window - self.max_output_tokens - self.reserve_tokens)
+        raw = max(256, self.context_window - self.max_output_tokens - self.reserve_tokens)
+        if self.max_input_tokens_cap is not None and self.max_input_tokens_cap > 0:
+            return min(raw, max(256, self.max_input_tokens_cap))
+        return raw
 
     @property
     def compression_limit(self) -> int:
@@ -100,9 +104,15 @@ class ContextWindowManager:
                 compacted, system_prompt, definitions
             )
             summary_limit = min(self.summary_max_chars, max(256, remaining * 3))
-            compacted.insert(
-                0, Message(role="assistant", content=self._summarize(older, summary_limit))
-            )
+            summary_text = self._summarize(older, summary_limit)
+            if compacted and compacted[0].role == "user" and isinstance(compacted[0].content, str):
+                compacted[0] = Message(
+                    role="user",
+                    content=f"{summary_text}\n\n{compacted[0].content}",
+                    name=compacted[0].name,
+                )
+            else:
+                compacted.insert(0, Message(role="user", content=summary_text))
 
         after = self._estimate_request(compacted, system_prompt, definitions)
         if after >= before and len(compacted) >= len(messages):

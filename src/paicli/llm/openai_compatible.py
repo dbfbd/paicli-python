@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import httpx
 
@@ -27,6 +29,28 @@ class OpenAICompatibleClient:
     max_context_window: int = 128_000
     prompt_cache: bool = False
     price_profile: ModelPriceProfile | None = None
+    _loop_clients: WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = field(
+        default_factory=WeakKeyDictionary, init=False, repr=False
+    )
+
+    def _http_client(self) -> httpx.AsyncClient:
+        """按当前事件循环复用长连接池，避免每轮重新 TLS 握手。"""
+        loop = asyncio.get_running_loop()
+        client = self._loop_clients.get(loop)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                timeout=self.timeout,
+                http2=False,
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            )
+            self._loop_clients[loop] = client
+        return client
+
+    async def aclose(self) -> None:
+        loop = asyncio.get_running_loop()
+        client = self._loop_clients.pop(loop, None)
+        if client is not None and not client.is_closed:
+            await client.aclose()
 
     @property
     def model_name(self) -> str:
@@ -82,10 +106,8 @@ class OpenAICompatibleClient:
 
         yield {"type": "message_start", "model": self.model}
         try:
-            async with (
-                httpx.AsyncClient(timeout=self.timeout, http2=False) as client,
-                client.stream("POST", url, headers=headers, json=payload) as response,
-            ):
+            client = self._http_client()
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
                 response.raise_for_status()
                 async for event in _iter_sse(response):
                     if event == "[DONE]":

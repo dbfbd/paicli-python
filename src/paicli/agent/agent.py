@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing, suppress
+from dataclasses import replace
 from typing import Any, Literal
 
 from paicli.agent.collaboration import Collaboration, LEAD_INSTRUCTIONS
@@ -95,17 +97,9 @@ class Agent:
                 yield event
             return
 
-        snapshot = SnapshotService(self.cwd)
-        with suppress(Exception):
-            snapshot.create("pre-turn")
-
-        try:
-            async with aclosing(self._run_react(message)) as stream:
-                async for event in stream:
-                    yield event
-        finally:
-            with suppress(Exception):
-                snapshot.create("post-turn")
+        async with aclosing(self._run_react(message)) as stream:
+            async for event in stream:
+                yield event
 
     async def run_complete(self, message: str) -> QueryResult:
         """异步消费全部流式事件，汇总为 QueryResult；遇到失败状态时抛出异常。"""
@@ -155,45 +149,172 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def _run_react(self, message: str) -> AsyncIterator[dict[str, Any]]:
-        """同一会话负责用户任务，并在有委派时把 Worker 用量并入最终事件。"""
+        """同一会话负责用户任务，按需写时创建快照，实时透传子流程进度事件并汇总用量。"""
+        from pathlib import Path
+
+        bg_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         collaboration = Collaboration(
-            llm_client=self.llm_client, registry=self.tool_registry,
-            config=self.config, cwd=self.cwd, approval_callback=self.approval_callback,
+            llm_client=self.llm_client,
+            registry=self.tool_registry,
+            config=self.config,
+            cwd=self.cwd,
+            approval_callback=self.approval_callback,
+            event_sink=bg_events.put_nowait,
         )
-        workflows = SpecializedWorkflows(self.llm_client, collaboration)
+        workflows = SpecializedWorkflows(
+            self.llm_client,
+            collaboration,
+            event_sink=bg_events.put_nowait,
+        )
         routing = workflows.routing_context(message, self.cwd)
         registry = collaboration.registry()
         workflows.register(registry, auto_plan=self.config.plan.auto_route)
-        stream = _query(
-            llm_client=self.llm_client, tool_registry=registry,
-            system_prompt=f"{self.system_prompt}\n\n{LEAD_INSTRUCTIONS}{routing}",
-            user_message=message, history=self.history, cwd=self.cwd,
-            config=self.config, approval_callback=collaboration.approval,
-            skill_context_buffer=self.skill_context_buffer, max_turns=self.max_turns,
-            before_finish=collaboration.pending_instruction,
-        )
+
+        snapshot = SnapshotService(self.cwd)
+        mutated = False
+        py_edited = False
+        ran_verification = False
+        verify_reminded = False
+        snapshot_lock = asyncio.Lock()
+
+        async def ensure_pre_snapshot() -> None:
+            nonlocal mutated
+            if mutated:
+                return
+            async with snapshot_lock:
+                if not mutated:
+                    with suppress(Exception):
+                        await asyncio.to_thread(snapshot.create, "pre-turn")
+                    mutated = True
+
+        # 仅在首次真正执行写类/命令工具前异步创建 pre-turn 快照，同时跟踪源码修改与验证状态。
+        for name in registry.list_names():
+            tool = registry.get(name)
+            if tool is None:
+                continue
+            if not tool.is_read_only:
+
+                async def _guarded(data, context, _tool=tool):
+                    nonlocal py_edited, ran_verification
+                    if not (_tool.name == "edit_file" and data.get("dry_run") is True):
+                        await ensure_pre_snapshot()
+                        if _tool.name in {"edit_file", "write_file"} and str(
+                            data.get("path", "")
+                        ).endswith(".py"):
+                            py_edited = True
+                            ran_verification = False
+                    result = await _tool.handler(data, context)
+                    if not result.is_error and _tool.name in {
+                        "execute_command",
+                        "debug_failure",
+                        "apply_work",
+                    }:
+                        cmd = str(data.get("command", ""))
+                        if _tool.name != "execute_command" or any(
+                            kw in cmd for kw in ("pytest", "unittest", "python ")
+                        ):
+                            ran_verification = True
+                    return result
+
+                registry.register(replace(tool, handler=_guarded))
+            elif tool.name == "collect_work":
+
+                async def _track_collect(data, context, _tool=tool):
+                    nonlocal ran_verification
+                    result = await _tool.handler(data, context)
+                    if not result.is_error and not data.get("discard"):
+                        ran_verification = True
+                    return result
+
+                registry.register(replace(tool, handler=_track_collect))
+
+        def before_finish() -> str:
+            nonlocal verify_reminded
+            if pending := collaboration.pending_instruction():
+                return pending
+            if (
+                py_edited
+                and not ran_verification
+                and not verify_reminded
+                and not workflows.debug_started
+                and (
+                    (Path(self.cwd) / "tests").is_dir()
+                    or any(Path(self.cwd).glob("test_*.py"))
+                )
+            ):
+                verify_reminded = True
+                return (
+                    "[Harness] 你修改了 Python 源码，但尚未运行任何测试验证。"
+                    "请在最终回复前运行相关 pytest 用例确认修改正确且无回归。"
+                )
+            return ""
+
+        merged: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        async def _pump_bg() -> None:
+            while True:
+                ev = await bg_events.get()
+                await merged.put(ev)
+
+        async def _pump_main() -> None:
+            stream = _query(
+                llm_client=self.llm_client,
+                tool_registry=registry,
+                system_prompt=f"{self.system_prompt}\n\n{LEAD_INSTRUCTIONS}{routing}",
+                user_message=message,
+                history=self.history,
+                cwd=self.cwd,
+                config=self.config,
+                approval_callback=collaboration.approval,
+                skill_context_buffer=self.skill_context_buffer,
+                max_turns=self.max_turns,
+                before_finish=before_finish,
+            )
+            try:
+                async with aclosing(stream):
+                    async for event in stream:
+                        await merged.put(event)
+            except Exception as exc:  # noqa: BLE001
+                await merged.put({"type": "error", "error": exc})
+            finally:
+                while not bg_events.empty():
+                    await merged.put(bg_events.get_nowait())
+                await merged.put(None)
+
+        bg_task = asyncio.create_task(_pump_bg())
+        main_task = asyncio.create_task(_pump_main())
         try:
-            async with aclosing(stream):
-                async for event in stream:
-                    if event.get("type") == "done":
-                        await collaboration.close()
-                        self.history = list(event.get("messages") or [])
-                        self.last_usage = (
-                            Usage.from_mapping(event.get("usage") or {})
-                            + collaboration.budget.usage
-                            + workflows.usage
-                        )
-                        self.last_cost = calculate_costs(self.llm_client, self.last_usage) or {}
-                        event = {
-                            **event, "usage": self.last_usage.to_dict(), "cost": self.last_cost,
-                            "total_tokens": self.last_usage.total_tokens,
-                            "total_turns": (
-                                event["total_turns"] + collaboration.budget.calls + workflows.calls
-                            ),
-                        }
-                    yield event
+            while (event := await merged.get()) is not None:
+                if event.get("type") == "done":
+                    await collaboration.close()
+                    self.history = list(event.get("messages") or [])
+                    self.last_usage = (
+                        Usage.from_mapping(event.get("usage") or {})
+                        + collaboration.budget.usage
+                        + workflows.total_usage
+                    )
+                    self.last_cost = calculate_costs(self.llm_client, self.last_usage) or {}
+                    event = {
+                        **event,
+                        "usage": self.last_usage.to_dict(),
+                        "cost": self.last_cost,
+                        "total_tokens": self.last_usage.total_tokens,
+                        "total_turns": (
+                            event["total_turns"]
+                            + collaboration.budget.calls
+                            + workflows.total_calls
+                        ),
+                    }
+                yield event
         finally:
+            bg_task.cancel()
+            if not main_task.done():
+                main_task.cancel()
+            await asyncio.gather(bg_task, main_task, return_exceptions=True)
             await collaboration.close()
+            if mutated:
+                with suppress(Exception):
+                    await asyncio.to_thread(snapshot.create, "post-turn")
 
     async def _run_team(self, message: str) -> AsyncIterator[dict[str, Any]]:
         """交给多 Agent 编排器执行任务，再接收其历史和统计。"""

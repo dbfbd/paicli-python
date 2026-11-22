@@ -10,16 +10,24 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: dict[str, Tool] = {}
+        self._aliases: dict[str, str] = {}
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
+        for alias in tool.aliases:
+            if alias and alias != tool.name:
+                self._aliases[alias] = tool.name
 
     def register_all(self, tools: list[Tool]) -> None:
         for tool in tools:
             self.register(tool)
 
     def get(self, name: str) -> Tool | None:
-        return self._tools.get(name)
+        tool = self._tools.get(name)
+        if tool is not None:
+            return tool
+        target = self._aliases.get(name)
+        return self._tools.get(target) if target else None
 
     def list_names(self) -> list[str]:
         return sorted(self._tools)
@@ -29,9 +37,12 @@ class ToolRegistry:
         return [self._tools[name].definition() for name in self.list_names()]
 
     def copy(self) -> ToolRegistry:
-        """新建会话的工具注册表，沿用基础工具实现。"""
+        """新建会话的工具注册表，沿用基础工具实现与兼容别名。"""
         registry = ToolRegistry()
         registry.register_all(list(self._tools.values()))
+        for alias, target in self._aliases.items():
+            if target in registry._tools:
+                registry._aliases[alias] = target
         return registry
 
     def read_only(self) -> ToolRegistry:
@@ -44,4 +55,7 @@ class ToolRegistry:
                 if tool.is_read_only and tool.is_concurrency_safe
             ]
         )
+        for alias, target in self._aliases.items():
+            if target in registry._tools:
+                registry._aliases[alias] = target
         return registry

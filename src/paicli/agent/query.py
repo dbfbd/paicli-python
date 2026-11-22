@@ -34,6 +34,7 @@ async def query(
     skill_context_buffer=None,
     max_turns: int = 20,
     before_finish: Callable[[], str] | None = None,
+    prompt_cwd: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """在限定轮数内交替调用模型和工具，向外产出统一事件。
 
@@ -42,8 +43,21 @@ async def query(
     此处完成表示当前执行循环结束，Debug 的验收由外层另行判定。
     """
     original_user_message = user_message
+    assembler = PromptAssembler(
+        config=config,
+        cwd=prompt_cwd or cwd,
+        tool_names=tool_registry.list_names(),
+        model=llm_client.model_name,
+        provider=llm_client.provider_name,
+    )
+    # 系统提示仅包含稳定静态前缀，保证多轮对话命中 Provider KV Prefix Cache；
+    # 时间戳与召回记忆等易变信息附在当前 user 消息前，不再污染系统前缀。
+    effective_system_prompt = f"{system_prompt}\n\n{assembler.build_runtime_static()}".strip()
+    turn_context = assembler.build_dynamic(original_user_message)
     user_message = _prepend_skill_candidates(user_message, cwd, config)
     user_message = _prepend_skill_context(user_message, skill_context_buffer)
+    if turn_context:
+        user_message = f"{turn_context}\n\n{user_message}"
     messages = [
         *(history or []),
         Message(role="user", content=parse_image_references(user_message, cwd)),
@@ -55,14 +69,6 @@ async def query(
         approval_callback=approval_callback,
         skill_context_buffer=skill_context_buffer,
     )
-    dynamic_prompt = PromptAssembler(
-        config=config,
-        cwd=cwd,
-        tool_names=tool_registry.list_names(),
-        model=llm_client.model_name,
-        provider=llm_client.provider_name,
-    ).build_dynamic(original_user_message)
-    effective_system_prompt = f"{system_prompt}\n\n{dynamic_prompt}".strip()
     context_manager = ContextWindowManager(
         ContextBudget(
             context_window=llm_client.max_context_window,
@@ -70,6 +76,7 @@ async def query(
             compression_threshold=config.memory.compression_threshold,
             compression_target=config.memory.compression_target,
             reserve_tokens=config.memory.compression_reserve_tokens,
+            max_input_tokens_cap=config.memory.compression_max_input_tokens,
         ),
         max_history_messages=config.memory.max_conversation_history,
         min_recent_messages=config.memory.min_recent_messages,
@@ -81,17 +88,28 @@ async def query(
     completed = False
     execution_status = ""
     stop_reason = "turn_limit"
+    truncation_retries = 0
+    max_truncation_retries = 2
+    effective_max_turns = max_turns
+    finish_grace_used = False
+    failure_streaks: dict[str, int] = {}
 
     # 一个任务可能包含多次模型调用；每轮把工具观察继续放回消息历史。
-    while turn < max_turns:
+    while turn < effective_max_turns:
         turn += 1
         text = ""
         reasoning = ""
         stop_reason = "end_turn"
         turn_usage = Usage()
         tool_states: dict[int, dict[str, Any]] = {}
-        # 当前工具的结果可能解锁下一轮的专用能力。
+        # 当前工具的结果可能解锁下一轮的专用能力；同时应用活动策略的配额过滤。
         tool_definitions = tool_registry.definitions()
+        if policy := active_policy():
+            tool_definitions = [
+                definition
+                for definition in tool_definitions
+                if policy.allows(definition.get("function", {}).get("name", ""))
+            ]
 
         if config.features.context_compression:
             compression = context_manager.prepare(
@@ -158,10 +176,28 @@ async def query(
         yield {"type": "turn_complete", "turn": turn, "stop_reason": stop_reason}
 
         if stop_reason == "max_tokens":
+            if truncation_retries < max_truncation_retries and turn < effective_max_turns:
+                truncation_retries += 1
+                messages.append(
+                    Message(
+                        role="user",
+                        content=(
+                            "Your previous output hit the max_tokens limit and was truncated "
+                            "before tool calls completed. Keep reasoning brief and emit fewer "
+                            "or smaller tool calls per turn (for example, write one file per turn "
+                            "or delegate independent modules with delegate_work when available), "
+                            "then continue."
+                        ),
+                    )
+                )
+                continue
             break
         if stop_reason != "tool_use" and not tool_calls:
             if before_finish and (reminder := before_finish()):
                 messages.append(Message(role="user", content=reminder))
+                if turn >= effective_max_turns and not finish_grace_used:
+                    finish_grace_used = True
+                    effective_max_turns += 1
                 continue
             completed = True
             break
@@ -200,15 +236,29 @@ async def query(
         injected = False
         # 用调用编号配对工具结果，下一次模型请求便能看到真实执行反馈。
         for result in tool_results:
+            tname = _tool_name_by_id(tool_calls, result.tool_use_id or "")
             yield {
                 "type": "tool_result",
-                "name": _tool_name_by_id(tool_calls, result.tool_use_id or ""),
+                "name": tname,
                 "result": result.content,
                 "is_error": result.is_error,
                 "tool_call_id": result.tool_use_id,
                 "evidence": result.evidence,
             }
             model_content = result.content
+            if result.is_error:
+                sig = f"{tname}:{model_content[:120]}"
+                failure_streaks[sig] = failure_streaks.get(sig, 0) + 1
+                if failure_streaks[sig] >= 2:
+                    model_content = (
+                        f"{model_content}\n"
+                        "[Harness] Repeated identical tool failure detected. "
+                        "Inspect the current file/error carefully and switch approach instead of retrying verbatim."
+                    )
+            else:
+                # 任何成功调用后重置同类工具错误计数。
+                for key in [k for k in failure_streaks if k.startswith(f"{tname}:")]:
+                    failure_streaks.pop(key, None)
             if loaded_skill_context and result.tool_use_id == injection_target:
                 model_content = f"{model_content}\n\n{loaded_skill_context}"
                 injected = True
@@ -238,12 +288,6 @@ async def query(
             break
         if policy and policy.halt_reason:
             break
-        if policy:
-            tool_definitions = [
-                definition
-                for definition in tool_definitions
-                if policy.allows(definition.get("function", {}).get("name", ""))
-            ]
 
     done_event: dict[str, Any] = {
         "type": "done",

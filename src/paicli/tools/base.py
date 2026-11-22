@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from paicli.config import PaiCliConfig
@@ -34,6 +35,7 @@ class ToolContext:
         None
     )
     skill_context_buffer: Any | None = None
+    read_versions: dict[Path, tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -50,6 +52,7 @@ class Tool:
     requires_approval: bool = False
     timeout: float | None = 60.0
     required_keys: list[str] = field(default_factory=list)
+    aliases: tuple[str, ...] = ()
 
     def definition(self) -> dict[str, Any]:
         """只导出模型需要的名称、用途和参数结构，本地处理函数仍由执行器持有。"""

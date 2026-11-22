@@ -35,7 +35,7 @@ from paicli.tools.base import Tool, ToolContext, ToolResult
 from paicli.tools.registry import ToolRegistry
 from paicli.types import Message, Usage
 
-_READ_TOOLS = {"read_file", "read_evidence", "grep_code", "glob_files"}
+_READ_TOOLS = {"read_file", "read_evidence", "grep", "grep_code", "glob", "glob_files"}
 
 
 def _parse_json_object(text: str) -> dict:
@@ -92,6 +92,7 @@ class DebugState(TypedDict, total=False):
     impact: dict
     progress_signature: str
     focus_only: bool
+    proposed_checked: bool
 
 
 class DebugCoordinator:
@@ -166,6 +167,7 @@ class DebugCoordinator:
         self.protected, self.history, self.executor = set(), [], None
         self.knowledge, self.knowledge_status = [], "disabled"
         self.helper_tokens, self.turns, self.usage = 0, 0, Usage()
+        self._accepted_receipt: tuple[str, dict[str, str], dict] | None = None
         self.requested_targets = list(self.targets)
         self.state: DebugState = {
             "flow_version": 4,
@@ -173,6 +175,7 @@ class DebugCoordinator:
             "next": "baseline",
             "error": "",
             "attempts": 0,
+            "proposed_checked": False,
             "findings": [],
             "feedback": "",
             "repair_text": "",
@@ -574,6 +577,7 @@ class DebugCoordinator:
             baseline=report,
             impact={"enabled": True, "status": "frozen", "plan": plan, "artifact": artifact},
         )
+        self._accepted_receipt = None
         current_run().record(
             "debug.scope_expanded",
             repair_files=self.patch_files,
@@ -613,6 +617,7 @@ class DebugCoordinator:
                     result = await handler(payload, context)
                     self.execution.wrote(path)
                     if path.read_bytes().decode("utf-8") != before:
+                        self._accepted_receipt = None
                         self.changes.setdefault(path, before)
                         self.book.source(path)
                         if self.executor:
@@ -680,10 +685,15 @@ class DebugCoordinator:
 
     async def _run_tests(self, _payload, _context):
         """按固定验收契约复测，登记报告与来源，再将真实结果反馈给修复员。"""
-        report = await verify_run(self.state["baseline"]["run_id"])
+        baseline_id = self.state["baseline"]["run_id"]
+        report = await verify_run(baseline_id)
         for a in report.get("artifacts", {}).values():
             self.book.bind(a)
         self.state["report"] = report
+        if report.get("status") == "accepted":
+            self._accepted_receipt = (baseline_id, self.execution.fingerprints(), report)
+        else:
+            self._accepted_receipt = None
         return ToolResult(
             json.dumps(
                 {
@@ -822,18 +832,12 @@ class DebugCoordinator:
 
     async def _repair(self, state):
         """在尝试上限内继续主修复会话；取得补丁后交给独立验收，累计预算跨尝试保留。"""
-        if state["attempts"] >= self.max_attempts:
-            return {
-                "status": "budget_exhausted",
-                "error": "Repair/verification round limit reached",
-                "next": END,
-            }
-        self._phase("主执行器持续阅读、修改并验证")
-        state["attempts"] += 1
-        if self.proposed_edit is not None and state["attempts"] == 1:
+        if self.proposed_edit is not None and not state.get("proposed_checked"):
+            state["proposed_checked"] = True
             name, payload = self.proposed_edit
             tool = self._registry(writable=True).get(name)
             if tool:
+                self._phase("先验证主会话候选编辑")
                 try:
                     proposal = await tool.execute(
                         payload, ToolContext(cwd=self.cwd, config=self.config)
@@ -841,18 +845,30 @@ class DebugCoordinator:
                 except ValueError as exc:
                     proposal = ToolResult(str(exc), is_error=True)
                 current_run().record(
-                    "debug.proposed_edit", tool=name,
-                    applied=bool(self.changes), is_error=proposal.is_error,
+                    "debug.proposed_edit",
+                    tool=name,
+                    applied=bool(self.changes),
+                    is_error=proposal.is_error,
                 )
                 if not proposal.is_error and self.changes:
                     patch, risks = self._patch()
                     return {
+                        "proposed_checked": True,
                         "patch": patch,
                         "risks": risks,
                         "repair_text": proposal.content,
                         "next": "verify",
                     }
                 state["feedback"] = f"主会话的候选编辑未能应用：{proposal.content[:1000]}"
+        if state["attempts"] >= self.max_attempts:
+            return {
+                "proposed_checked": state.get("proposed_checked", False),
+                "status": "budget_exhausted",
+                "error": "Repair/verification round limit reached",
+                "next": END,
+            }
+        self._phase("主执行器持续阅读、修改并验证")
+        state["attempts"] += 1
         spec = TaskSpec(
             "repairer",
             "repair",
@@ -883,6 +899,8 @@ class DebugCoordinator:
         )
         patch, risks = self._patch()
         update = {
+            "attempts": state["attempts"],
+            "proposed_checked": state.get("proposed_checked", False),
             "patch": patch,
             "risks": risks,
             "repair_text": "已生成补丁，结果以原验收为准。" if patch["chars"] else result.content,
@@ -961,8 +979,21 @@ class DebugCoordinator:
 
     async def _verify(self, state):
         """依据原验收契约重新运行测试，通过后按风险进入审核，拒绝后携带反馈返回修复。"""
-        self._phase("独立运行原验收")
-        report = await verify_run(state["baseline"]["run_id"])
+        baseline_id = state["baseline"]["run_id"]
+        cached = self._accepted_receipt
+        reused = False
+        if (
+            cached is not None
+            and cached[0] == baseline_id
+            and cached[1] == self.execution.fingerprints()
+        ):
+            self._phase("复核已通过的原验收回执")
+            report = cached[2]
+            reused = True
+        else:
+            self._phase("独立运行原验收")
+            report = await verify_run(baseline_id)
+        self._accepted_receipt = None
         for a in report.get("artifacts", {}).values():
             self.book.bind(a)
         current_run().record(
@@ -970,6 +1001,7 @@ class DebugCoordinator:
             status=report["status"],
             verification_run=report["run_id"],
             attempt=state["attempts"],
+            reused_receipt=reused,
         )
         # 验收通过后再按风险决定是否调用模型审核，简单补丁可直接交付。
         if report["status"] == "accepted":

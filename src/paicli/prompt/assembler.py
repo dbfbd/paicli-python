@@ -88,20 +88,29 @@ class PromptAssembler:
             )
         return "\n".join(parts)
 
-    def build_dynamic(self, user_message: str) -> str:
-        """按当前请求补充时间、目录、模型、工具及相关长期记忆。"""
+    def build_runtime_static(self) -> str:
+        """组装会话期间保持不变的运行环境元信息，可安全放入缓存系统前缀。"""
         shell = (
             os.environ.get("COMSPEC", "cmd.exe") if platform.system() == "Windows" else "/bin/sh"
         )
+        return "\n".join(
+            [
+                '<runtime-context trust="generated">',
+                f"Working directory: {self.cwd}",
+                f"Operating system: {platform.system()}",
+                f"Command interpreter: {shell}",
+                f"Model: {self.model} ({self.provider})",
+                f"Available tools: {', '.join(self.tool_names)}",
+                "</runtime-context>",
+            ]
+        )
+
+    def build_dynamic(self, user_message: str) -> str:
+        """按当前请求补充易变时间与相关长期记忆，应附在用户消息中而非击穿系统前缀缓存。"""
         parts = [
-            '<runtime-context trust="generated">',
+            '<turn-context trust="generated">',
             f"Current time: {datetime.now().astimezone().isoformat(timespec='seconds')}",
-            f"Working directory: {self.cwd}",
-            f"Operating system: {platform.system()}",
-            f"Command interpreter: {shell}",
-            f"Model: {self.model} ({self.provider})",
-            f"Available tools: {', '.join(self.tool_names)}",
-            "</runtime-context>",
+            "</turn-context>",
         ]
         memories = self._recalled_memories(user_message)
         if memories:

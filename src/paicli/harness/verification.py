@@ -8,7 +8,6 @@ import json
 import math
 import os
 import signal
-import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -18,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from paicli.harness.evidence import EvidenceRun, load_run
+from paicli.harness.project_env import resolve_project_python
 
 _SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".paicli", ".pytest_cache"}
 _CONFIG_NAMES = {"pytest.ini", ".pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}
@@ -29,12 +29,41 @@ _ENV_POLICY = {
 }
 
 
+_RACY_STAT_WINDOW_NS = 500_000_000  # 0.5s 保护窗口，避免同 tick 写同长度文件命中旧缓存
+_DIGEST_CACHE_MAX = 4096
+_DIGEST_CACHE: dict[str, tuple[int, int, str]] = {}
+_INTERPRETER_CACHE_TTL = 60.0
+_INTERPRETER_CACHE: dict[
+    tuple[str, str, str],
+    tuple[int, int, tuple[tuple[str, int], ...], dict[str, Any], float],
+] = {}
+
+
 def _digest(path: Path) -> str:
+    key = str(path)
+    try:
+        st = path.stat()
+    except OSError:
+        _DIGEST_CACHE.pop(key, None)
+        raise
+    now_ns = time.time_ns()
+    cached = _DIGEST_CACHE.get(key)
+    if (
+        cached is not None
+        and cached[0] == st.st_mtime_ns
+        and cached[1] == st.st_size
+        and (now_ns - st.st_mtime_ns) >= _RACY_STAT_WINDOW_NS
+    ):
+        return cached[2]
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
-    return digest.hexdigest()
+    hex_digest = digest.hexdigest()
+    if len(_DIGEST_CACHE) >= _DIGEST_CACHE_MAX:
+        _DIGEST_CACHE.clear()
+    _DIGEST_CACHE[key] = (st.st_mtime_ns, st.st_size, hex_digest)
+    return hex_digest
 
 
 def _files(root: Path):
@@ -160,11 +189,49 @@ async def _stop(process: asyncio.subprocess.Process) -> None:
 
 
 async def _interpreter(run: EvidenceRun, executable: str, env: dict) -> dict:
+    exec_path = Path(executable)
+    stable_env = {
+        key: value
+        for key, value in env.items()
+        if key not in {"PYTHONPYCACHEPREFIX", "PWD", "OLDPWD", "_"}
+    }
+    env_sha = hashlib.sha256(
+        json.dumps(stable_env, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    plugin_policy = os.environ.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "")
+    cache_key = (str(exec_path), env_sha, plugin_policy)
+    try:
+        exec_stat = exec_path.stat()
+    except OSError:
+        exec_stat = None
+    cached = _INTERPRETER_CACHE.get(cache_key)
+    if cached is not None and exec_stat is not None:
+        c_mtime, c_size, watched_dirs, c_identity, cached_at = cached
+        if (
+            c_mtime == exec_stat.st_mtime_ns
+            and c_size == exec_stat.st_size
+            and (time.monotonic() - cached_at) < _INTERPRETER_CACHE_TTL
+        ):
+            dirs_intact = True
+            for dir_str, expected_mtime in watched_dirs:
+                try:
+                    if os.stat(dir_str).st_mtime_ns != expected_mtime:
+                        dirs_intact = False
+                        break
+                except OSError:
+                    dirs_intact = False
+                    break
+            if dirs_intact:
+                return dict(c_identity)
+
     script = (
-        "import sys,json,hashlib,importlib.metadata as m;"
+        "import os,sys,json,hashlib,importlib.metadata as m;"
         "packages=sorted((d.metadata.get('Name',''),d.version) for d in m.distributions());"
+        "site_dirs=sorted({os.path.abspath(p) for p in sys.path "
+        "if p and os.path.isdir(p) and ('site-packages' in p or 'dist-packages' in p)});"
         "print(json.dumps({'version':sys.version,'prefix':sys.prefix,"
-        "'packages_sha256':hashlib.sha256(json.dumps(packages).encode()).hexdigest()}))"
+        "'packages_sha256':hashlib.sha256(json.dumps(packages).encode()).hexdigest(),"
+        "'_site_dirs':site_dirs}))"
     )
     process = await asyncio.create_subprocess_exec(
         executable,
@@ -184,16 +251,26 @@ async def _interpreter(run: EvidenceRun, executable: str, env: dict) -> dict:
     if process.returncode:
         raise ValueError("Could not inspect the selected Python interpreter")
     identity = json.loads(stdout)
-    identity["executable_sha256"] = _digest(Path(executable))
-    stable_env = {
-        key: value
-        for key, value in env.items()
-        if key not in {"PYTHONPYCACHEPREFIX", "PWD", "OLDPWD", "_"}
-    }
-    identity["environment_sha256"] = hashlib.sha256(
-        json.dumps(stable_env, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    identity["plugin_autoload_policy"] = os.environ.get("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "")
+    site_dirs = identity.pop("_site_dirs", [])
+    identity["executable_sha256"] = _digest(exec_path)
+    identity["environment_sha256"] = env_sha
+    identity["plugin_autoload_policy"] = plugin_policy
+    if exec_stat is not None:
+        watched: list[tuple[str, int]] = []
+        for dir_str in site_dirs:
+            try:
+                watched.append((dir_str, os.stat(dir_str).st_mtime_ns))
+            except OSError:
+                continue
+        if len(_INTERPRETER_CACHE) >= 64:
+            _INTERPRETER_CACHE.clear()
+        _INTERPRETER_CACHE[cache_key] = (
+            exec_stat.st_mtime_ns,
+            exec_stat.st_size,
+            tuple(watched),
+            dict(identity),
+            time.monotonic(),
+        )
     return identity
 
 
@@ -341,9 +418,8 @@ async def create_baseline(
             "Use an existing project directory and a timeout between 0 and 3600 seconds"
         )
     selected = _targets(root, targets)
-    candidate = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     python = Path(
-        python_executable or (str(candidate) if candidate.exists() else sys.executable)
+        resolve_project_python(root, explicit=python_executable)
     ).absolute()
     if not python.is_file():
         raise ValueError("The selected Python interpreter does not exist")

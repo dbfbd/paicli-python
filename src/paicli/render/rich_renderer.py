@@ -105,21 +105,26 @@ class RichRenderer:
             thinking = str(event.get("thinking") or "")
             self._thinking_buffer.append(thinking)
             self._update_live_thinking()
-        elif event_type == "plan_status":
+        elif event_type == "team_status":
             self._flush_thinking()
-            self._flush_markdown(title="Plan")
-        elif event_type == "plan_task_started":
+            phase = str(event.get("phase") or "update")
+            task_id = str(event.get("task_id") or "")
+            label = f"[cyan]Team[/cyan] {phase}" + (f" ({task_id})" if task_id else "")
+            self.console.print(label)
+        elif event_type == "explore_status":
             self._flush_thinking()
-            self._flush_markdown(title="Plan")
-            task_id = str(event.get("task_id") or "task")
-            description = str(event.get("task_description") or "")
-            self.console.print(
-                _output_panel(
-                    Text(description, style="#e5e7eb"),
-                    title=Text(f"Running {task_id}", style="bold #22d3ee"),
-                    border_style="#0891b2",
-                )
-            )
+            phase = str(event.get("phase") or "")
+            if phase == "started":
+                topics = ", ".join(str(t) for t in event.get("topics") or [])
+                self.console.print(f"[cyan]Explore[/cyan] started ({topics})")
+            else:
+                topic = str(event.get("topic") or "")
+                status = str(event.get("status") or "")
+                self.console.print(f"[cyan]Explore[/cyan] {topic}: {status}")
+        elif event_type in {"debug_started", "debug_status"}:
+            self._flush_thinking()
+            msg = str(event.get("message") or f"Debug run {event.get('run_id', '')}")
+            self.console.print(f"[magenta]{msg}[/magenta]")
         elif event_type == "usage":
             self._record_usage(event.get("usage") or {})
         elif event_type == "turn_complete":

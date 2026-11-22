@@ -85,6 +85,15 @@ def main(
         str,
         typer.Option("--worker-mode", hidden=True),
     ] = "react",
+    # 权限审批
+    auto_approve: Annotated[
+        bool,
+        typer.Option(
+            "-y",
+            "--auto-approve",
+            help="Auto-approve high-risk tools and Team checks (sets hitl_mode=never)",
+        ),
+    ] = False,
     # 输出格式
     json_output: Annotated[
         bool,
@@ -126,6 +135,8 @@ def main(
         overrides["llm"] = llm_overrides
     if plain:
         overrides["render_mode"] = "plain"
+    if auto_approve:
+        overrides["policy"] = {"hitl_mode": "never"}
 
     config = load_config(project_root=root, overrides=overrides)
     if plain:

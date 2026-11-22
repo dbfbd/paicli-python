@@ -21,6 +21,21 @@ from uuid import uuid4
 
 _CURRENT: ContextVar[EvidenceRun | None] = ContextVar("paicli_run", default=None)
 _TASK: ContextVar[dict[str, Any] | None] = ContextVar("paicli_task", default=None)
+_MANIFEST_SYNC_EVENTS = frozenset(
+    {
+        "run.started",
+        "run.resumed",
+        "run.finished",
+        "run.error",
+        "artifact.saved",
+        "debug.node_started",
+        "debug.checkpoint",
+        "execution.opened",
+        "execution.stopped",
+        "budget.model_started",
+        "budget.model_finished",
+    }
+)
 
 
 def current_run() -> EvidenceRun | None:
@@ -103,8 +118,8 @@ class EvidenceRun:
             with suppress(OSError):
                 temporary.unlink(missing_ok=True)
 
-    def record(self, event_type: str, **fields) -> None:
-        """追加带执行上下文的事件，同时保存更新后的运行清单。"""
+    def record(self, event_type: str, *, sync_manifest: bool = False, **fields) -> None:
+        """追加带执行上下文的事件，仅在关键清单状态变更时原子重写 run.json。"""
         with self._lock:
             self.manifest["sequence"] += 1
             event = {
@@ -118,7 +133,8 @@ class EvidenceRun:
             }
             with (self.directory / "events.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
-            self._save()
+            if sync_manifest or event_type in _MANIFEST_SYNC_EVENTS:
+                self._save()
 
     def save_text(self, kind: str, text: str) -> dict:
         """将原始文本保存为产物，并返回可供后续引用的元数据。"""

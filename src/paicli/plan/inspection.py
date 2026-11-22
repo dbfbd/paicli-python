@@ -99,8 +99,8 @@ async def inspect_plan(
     text = "\n\n".join(
         observation for _, observation in sorted(observations, key=lambda x: x[0])
     )
-    if len(text) > 6_000:
-        text = text[:6_000] + "\n[更多调查结果可在本次执行记录中查看]"
+    if len(text) > 10_000:
+        text = text[:10_000] + "\n[更多调查结果可在本次执行记录中查看]"
     yield {"type": "plan_evidence", "text": text}
 
 

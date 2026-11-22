@@ -6,7 +6,6 @@ import asyncio
 import os
 import platform
 from contextlib import suppress
-from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -396,21 +395,11 @@ def get_builtin_tools() -> list[Tool]:
             requires_approval=True,
         ),
     ]
-    aliases = {"glob": "glob_files", "grep": "grep_code", "execute_command": "bash"}
-    result = []
-    for tool in tools:
-        result.append(tool)
-        if tool.name in aliases:
-            result.append(
-                replace(
-                    tool,
-                    name=aliases[tool.name],
-                    description="Compatibility alias. " + tool.description,
-                    parameters=deepcopy(tool.parameters),
-                    required_keys=list(tool.required_keys),
-                )
-            )
-    return result
+    aliases = {"glob": ("glob_files",), "grep": ("grep_code",), "execute_command": ("bash",)}
+    return [
+        replace(tool, aliases=aliases[tool.name]) if tool.name in aliases else tool
+        for tool in tools
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -418,8 +407,16 @@ def get_builtin_tools() -> list[Tool]:
 # ---------------------------------------------------------------------------
 
 
+def _file_version(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
 async def _read_file(payload: dict[str, Any], context: ToolContext) -> ToolResult:
-    """适配文件读取参数；遇到 Word 文档时转交文档解析工具。"""
+    """适配文件读取参数；遇到 Word 文档时转交文档解析工具，并记录已读版本供写前新鲜度校验。"""
     if Path(str(payload["path"])).suffix.lower() == ".docx":
         return await _read_document(payload, context)
     result: FileOpResult = fops.read_file(
@@ -429,6 +426,13 @@ async def _read_file(payload: dict[str, Any], context: ToolContext) -> ToolResul
         limit=int(payload.get("limit") or 500),
         path_guard_enabled=context.config.policy.path_guard_enabled,
     )
+    if not result.is_error:
+        with suppress(Exception):
+            resolved = fops.resolve_path(
+                context.cwd, str(payload["path"]), context.config.policy.path_guard_enabled
+            )
+            if (ver := _file_version(resolved)) is not None:
+                context.read_versions[resolved] = ver
     return _to_tool_result(result)
 
 
@@ -453,6 +457,13 @@ async def _write_file(payload: dict[str, Any], context: ToolContext) -> ToolResu
         append=bool(payload.get("append")),
         path_guard_enabled=context.config.policy.path_guard_enabled,
     )
+    if not result.is_error:
+        with suppress(Exception):
+            resolved = fops.resolve_path(
+                context.cwd, str(payload["path"]), context.config.policy.path_guard_enabled
+            )
+            if (ver := _file_version(resolved)) is not None:
+                context.read_versions[resolved] = ver
     return _to_tool_result(result)
 
 
@@ -465,6 +476,20 @@ async def _edit_file(payload: dict[str, Any], context: ToolContext) -> ToolResul
         return ToolResult("edit_file requires a boolean for dry_run.", is_error=True)
     if any(key in payload and type(payload[key]) is not int for key in ("start_line", "end_line")):
         return ToolResult("edit_file requires integer line bounds.", is_error=True)
+    resolved: Path | None = None
+    if not dry_run:
+        with suppress(Exception):
+            resolved = fops.resolve_path(
+                context.cwd, path, context.config.policy.path_guard_enabled
+            )
+            expected = context.read_versions.get(resolved)
+            current = _file_version(resolved)
+            if expected is not None and current is not None and current != expected:
+                return ToolResult(
+                    f"[Harness] {path} has changed on disk since you last read it. "
+                    "Call read_file again to refresh before editing.",
+                    is_error=True,
+                )
     result: FileOpResult = fops.edit_file(
         context.cwd,
         path,
@@ -475,6 +500,9 @@ async def _edit_file(payload: dict[str, Any], context: ToolContext) -> ToolResul
         start_line=payload.get("start_line"),
         end_line=payload.get("end_line"),
     )
+    if not dry_run and not result.is_error and resolved is not None:
+        if (ver := _file_version(resolved)) is not None:
+            context.read_versions[resolved] = ver
     return _to_tool_result(result)
 
 

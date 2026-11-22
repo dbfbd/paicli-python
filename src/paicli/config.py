@@ -23,7 +23,7 @@ class LlmConfig:
     # 可选的每百万 token 单价覆盖，先按币种组织，
     # 再区分缓存命中、未命中与输出；价格可随服务方调整。
     prices: dict[str, dict[str, float]] = field(default_factory=dict)
-    max_tokens: int = 8192
+    max_tokens: int = 16_384
     temperature: float = 0.7
     timeout: float = 120.0
 
@@ -56,6 +56,7 @@ class MemoryConfig:
     compression_threshold: float = 0.8
     compression_target: float = 0.55
     compression_reserve_tokens: int = 1_024
+    compression_max_input_tokens: int = 128_000
     min_recent_messages: int = 6
     summary_max_chars: int = 6_000
 
@@ -99,9 +100,18 @@ class PlanConfig:
 class TeamConfig:
     max_active_workers: int = 5
     max_worker_turns: int = 18
-    max_model_calls: int = 48
-    max_tokens: int = 200_000
+    max_model_calls: int = 64
+    max_tokens: int = 500_000
     timeout: float = 360
+
+
+@dataclass(slots=True)
+class DebugConfig:
+    max_models: int = 24
+    max_tokens: int = 240_000
+    max_tools: int = 60
+    max_attempts: int = 3
+    timeout: float = 60.0
 
 
 @dataclass(slots=True)
@@ -126,6 +136,7 @@ class PaiCliConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     plan: PlanConfig = field(default_factory=PlanConfig)
     team: TeamConfig = field(default_factory=TeamConfig)
+    debug: DebugConfig = field(default_factory=DebugConfig)
 
 
 def load_config(
@@ -311,6 +322,7 @@ def _dict_to_config(data: dict[str, Any]) -> PaiCliConfig:
         features=FeatureConfig(**data.get("features", {})),
         plan=PlanConfig(**plan),
         team=TeamConfig(**data.get("team", {})),
+        debug=DebugConfig(**data.get("debug", {})),
     )
 
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from paicli.agent import QueryEngine
 from paicli.config import load_config
@@ -10,14 +12,26 @@ from paicli.llm import create_llm_client
 from paicli.tools import ToolRegistry, get_builtin_tools
 
 
-def create_default_engine(cwd: str | None = None) -> QueryEngine:
+def create_default_engine(
+    cwd: str | None = None,
+    *,
+    approval_callback: Callable[[dict[str, Any]], Any] | None = None,
+    auto_approve: bool = False,
+) -> QueryEngine:
     """解析目标目录并加载配置，组装模型客户端和工具后返回统一查询引擎。"""
     root = str(Path(cwd or ".").resolve())
-    config = load_config(project_root=root)
+    overrides = {"policy": {"hitl_mode": "never"}} if auto_approve else None
+    config = load_config(project_root=root, overrides=overrides)
     client = create_llm_client(config.llm)
     registry = ToolRegistry()
     registry.register_all(get_builtin_tools())
-    return QueryEngine(llm_client=client, tool_registry=registry, config=config, cwd=root)
+    return QueryEngine(
+        llm_client=client,
+        tool_registry=registry,
+        config=config,
+        cwd=root,
+        approval_callback=approval_callback,
+    )
 
 
 __all__ = ["QueryEngine", "create_default_engine"]

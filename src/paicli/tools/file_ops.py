@@ -12,7 +12,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 
-from paicli.lsp import diagnose_file
+from paicli.lsp import diagnose_python_edit
 from paicli.policy import PathGuard
 
 # ---------------------------------------------------------------------------
@@ -132,6 +132,12 @@ def write_file(
 
     resolved.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if append else "w"
+    before_text: str | None = None
+    if resolved.is_file() and resolved.suffix == ".py":
+        try:
+            before_text = resolved.read_text(encoding="utf-8")
+        except OSError:
+            before_text = None
     try:
         with resolved.open(mode, encoding="utf-8") as handle:
             handle.write(content)
@@ -141,7 +147,7 @@ def write_file(
     rel = _relative_to(resolved, cwd)
     suffix = ""
     if run_diagnostics and resolved.suffix == ".py":
-        diagnostics = diagnose_file(resolved)
+        diagnostics = diagnose_python_edit(cwd, resolved, before_text=before_text)
         if diagnostics:
             suffix = "\n\nDiagnostics:\n" + "\n".join(diagnostics)
     return FileOpResult(f"Wrote {rel}{suffix}", display_summary=f"Wrote {rel}")
@@ -250,7 +256,7 @@ def edit_file(
 
     suffix = ""
     if resolved.suffix == ".py":
-        diagnostics = diagnose_file(resolved)
+        diagnostics = diagnose_python_edit(cwd, resolved, before_text=original)
         if diagnostics:
             suffix = "\n\nDiagnostics:\n" + "\n".join(diagnostics)
 

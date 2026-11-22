@@ -299,11 +299,54 @@ async def _handle_slash(
                 cwd=cwd,
                 approval_callback=agent.approval_callback,
             )
+            done_event: dict[str, Any] = {}
+
+            async def _tracked_team():
+                nonlocal done_event
+                async for ev in orchestrator.run(team_task):
+                    if ev.get("type") == "done":
+                        done_event = ev
+                    yield ev
+
             await _run_events(
-                orchestrator.run(team_task),
-                RichRenderer(),
+                _tracked_team(),
+                renderer,
                 agent.llm_client.max_context_window,
             )
+            if done_event:
+                from paicli.types import Usage
+
+                agent.last_usage = Usage.from_mapping(done_event.get("usage") or {})
+                agent.last_cost = dict(done_event.get("cost") or {})
+                ev_dir = done_event.get("evidence_dir")
+                patch_path = Path(ev_dir) / "team.patch" if ev_dir else None
+                if (
+                    done_event.get("status") == "completed"
+                    and patch_path is not None
+                    and patch_path.is_file()
+                    and sys.stdin.isatty()
+                ):
+                    apply_now = Prompt.ask(
+                        f"Apply verified Team patch ({patch_path}) to workspace?",
+                        choices=["y", "n"],
+                        default="n",
+                    )
+                    if apply_now == "y":
+                        import subprocess
+
+                        proc = subprocess.run(
+                            ["git", "apply", "--binary", "--whitespace=nowarn", str(patch_path)],
+                            cwd=cwd,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                        )
+                        if proc.returncode == 0:
+                            console.print("[green]Applied verified Team patch.[/green]")
+                        else:
+                            console.print(
+                                f"[red]Patch apply failed:[/red] {proc.stderr.strip()}"
+                            )
     elif command == "/model":
         await _model_command(arg, console, cwd, config, agent, registry, renderer)
     elif command == "/usage":

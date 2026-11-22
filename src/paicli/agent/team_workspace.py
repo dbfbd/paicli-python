@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
+from threading import RLock
 
 
 class TeamWorkspaceError(RuntimeError):
@@ -58,6 +59,7 @@ class TeamWorkspace:
         self._temporary: TemporaryDirectory | None = None
         self._root: Path | None = None
         self._workers: dict[str, Path] = {}
+        self._worker_checks: dict[str, Path] = {}
         self._handoffs: dict[str, tuple[str, ...]] = {}
         self._seeded: dict[str, dict[str, str]] = {}
         self._worktrees: list[Path] = []
@@ -66,6 +68,7 @@ class TeamWorkspace:
         self._integration_base: str | None = None
         self.candidate_revision: str | None = None
         self._next = 0
+        self._lock = RLock()
 
     def __enter__(self) -> TeamWorkspace:
         self.repository = Path(
@@ -103,10 +106,11 @@ class TeamWorkspace:
         """创建或复用相同任务的工作区，保留等待消息前已完成的编辑。"""
         if not task_id:
             raise TeamWorkspaceError("Team task ID must be non-empty")
-        if task_id not in self._workers:
-            self._workers[task_id] = self._add("worker")
-            self._seeded[task_id] = {}
-        return str(self._workers[task_id])
+        with self._lock:
+            if task_id not in self._workers:
+                self._workers[task_id] = self._add("worker")
+                self._seeded[task_id] = {}
+            return str(self._workers[task_id])
 
     def source_state(
         self, lead_paths: tuple[str, ...], worker_paths: tuple[str, ...]
@@ -424,29 +428,58 @@ class TeamWorkspace:
         )
         return diff.decode("utf-8", errors="surrogateescape"), head
 
+    def open_check_workspace(self) -> str:
+        """为并行检查创建一个绑定到 candidate_revision 的独立工作区。"""
+        if self.candidate_revision is None:
+            raise TeamWorkspaceError("No Team integration candidate is available")
+        return str(self._add("check", self.candidate_revision))
+
+    def close_check_workspace(self, path: str | Path) -> None:
+        self._remove(Path(path))
+
     @contextmanager
     def check_workspace(self):
         """每条检查从同一个组合提交开始，产生的文件不会影响下一条检查。"""
-        if self.candidate_revision is None:
-            raise TeamWorkspaceError("No Team integration candidate is available")
-        workspace = self._add("check", self.candidate_revision)
+        workspace = Path(self.open_check_workspace())
         try:
             yield str(workspace)
         finally:
             self._remove(workspace)
 
     @contextmanager
+    def reusable_check_workspace(self):
+        """串行检查批次复用单个隔离工作区，仅在检查写出脏文件时重置，大幅削减 worktree 抖动。"""
+        if self.candidate_revision is None:
+            raise TeamWorkspaceError("No Team integration candidate is available")
+        revision = self.candidate_revision
+        workspace = self._add("check-batch", revision)
+
+        def reset_if_dirty() -> None:
+            if self._git(workspace, "status", "--porcelain"):
+                self._git(workspace, "checkout", "--detach", "--force", revision)
+                self._git(workspace, "clean", "-fd")
+
+        try:
+            yield str(workspace), reset_if_dirty
+        finally:
+            self._remove(workspace)
+
+    @contextmanager
     def worker_check_workspace(self, task_id: str, paths: tuple[str, ...]):
-        """让本地检查读 Worker 的真实改动，同时隔离测试的写入。"""
+        """复用每 Worker 独立的检查副本，仅切换快照提交并清理脏文件，避免每次自测重建 worktree。"""
         self.capture(task_id, paths)
         cwd = self._worker(task_id)
         tree = self._git(cwd, "write-tree").decode().strip()
         revision = self._commit(cwd, tree, "PaiCLI worker check")
-        workspace = self._add("worker-check", revision)
-        try:
-            yield str(workspace), revision
-        finally:
-            self._remove(workspace)
+        with self._lock:
+            workspace = self._worker_checks.get(task_id)
+            if workspace is None:
+                workspace = self._add("worker-check", revision)
+                self._worker_checks[task_id] = workspace
+            else:
+                self._git(workspace, "checkout", "--detach", "--force", revision)
+                self._git(workspace, "clean", "-fd")
+        yield str(workspace), revision
 
     def _commit(
         self, cwd: Path, tree: str, message: str, *, parent: str | None = None
@@ -477,38 +510,41 @@ class TeamWorkspace:
         return worker
 
     def _add(self, label: str, revision: str | None = None) -> Path:
-        if self._root is None:
-            raise TeamWorkspaceError("Team workspace must be entered before use")
-        self._next += 1
-        path = self._root / f"{label}-{self._next}"
-        try:
-            self._git(
-                self.repository,
-                "worktree",
-                "add",
-                "--detach",
-                str(path),
-                revision or self.base,
-            )
-        except TeamWorkspaceError:
-            if path.exists():
-                try:
-                    self._git(
-                        self.repository, "worktree", "remove", "--force", str(path)
-                    )
-                except TeamWorkspaceError:
-                    pass
-            raise
-        self._worktrees.append(path)
-        return path
+        with self._lock:
+            if self._root is None:
+                raise TeamWorkspaceError("Team workspace must be entered before use")
+            self._next += 1
+            path = self._root / f"{label}-{self._next}"
+            try:
+                self._git(
+                    self.repository,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(path),
+                    revision or self.base,
+                )
+            except TeamWorkspaceError:
+                if path.exists():
+                    try:
+                        self._git(
+                            self.repository, "worktree", "remove", "--force", str(path)
+                        )
+                    except TeamWorkspaceError:
+                        pass
+                raise
+            self._worktrees.append(path)
+            return path
 
     def _remove(self, path: Path) -> None:
-        if self._root is None or path.resolve().parent != self._root:
-            raise TeamWorkspaceError(
-                "Refusing to remove a directory outside the Team workspace"
-            )
-        self._git(self.repository, "worktree", "remove", "--force", str(path))
-        self._worktrees.remove(path)
+        with self._lock:
+            if self._root is None or path.resolve().parent != self._root:
+                raise TeamWorkspaceError(
+                    "Refusing to remove a directory outside the Team workspace"
+                )
+            self._git(self.repository, "worktree", "remove", "--force", str(path))
+            if path in self._worktrees:
+                self._worktrees.remove(path)
 
     def _untracked(self, cwd: Path, *paths: str) -> bytes:
         return self._git(

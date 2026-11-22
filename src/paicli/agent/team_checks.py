@@ -5,27 +5,20 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
-import shutil
 import signal
 import subprocess
-import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
 from inspect import isawaitable
 from itertools import groupby
-from operator import or_
 from pathlib import Path
-from typing import Annotated, TypedDict
-
-from langgraph.graph import END, START, StateGraph
-from langgraph.runtime import Runtime
-from langgraph.types import Send
 
 from paicli.agent.team_board import TeamCheck
 from paicli.agent.team_workspace import TeamWorkspace
 from paicli.config import PaiCliConfig
 from paicli.harness.evidence import current_run
+from paicli.harness.project_env import augment_env_for_venv, resolve_project_executable
 from paicli.policy import CommandGuard
 
 _CAPTURE_LIMIT = 64 * 1024
@@ -52,52 +45,6 @@ class TeamCheckResult:
     status: str = "passed"
 
 
-@dataclass(slots=True)
-class _CandidateContext:
-    workspace: TeamWorkspace
-    config: PaiCliConfig
-    approval_callback: Callable | None
-
-    async def run(self, check: TeamCheck) -> TeamCheckResult:
-        with self.workspace.check_workspace() as candidate:
-            return await run_team_check(
-                check,
-                candidate,
-                config=self.config,
-                approval_callback=self.approval_callback,
-                revision=self.workspace.candidate_revision,
-            )
-
-
-class _CheckBatch(TypedDict, total=False):
-    checks: tuple[TeamCheck, ...]
-    results: Annotated[dict[str, TeamCheckResult], or_]
-
-
-class _CheckInput(TypedDict):
-    check: TeamCheck
-
-
-def _send_checks(state: _CheckBatch) -> list[Send]:
-    return [Send("check", {"check": check}) for check in state["checks"]]
-
-
-async def _check_node(
-    state: _CheckInput, runtime: Runtime[_CandidateContext]
-) -> _CheckBatch:
-    check = state["check"]
-    return {"results": {check.id: await runtime.context.run(check)}}
-
-
-_CHECK_GRAPH = (
-    StateGraph(_CheckBatch, context_schema=_CandidateContext)
-    .add_node("check", _check_node)
-    .add_conditional_edges(START, _send_checks, ["check"])
-    .add_edge("check", END)
-    .compile()
-)
-
-
 async def run_candidate_checks(
     checks: tuple[TeamCheck, ...],
     workspace: TeamWorkspace,
@@ -105,8 +52,7 @@ async def run_candidate_checks(
     config: PaiCliConfig,
     approval_callback=None,
 ) -> AsyncIterator[tuple[TeamCheck, TeamCheckResult]]:
-    """未声明独立的检查保留顺序，独立检查分批并发，每项仍有单独的工作区。"""
-    context = _CandidateContext(workspace, config, approval_callback)
+    """串行检查复用单个隔离检查副本以减少 worktree 抖动；并行安全检查按并发上限并发执行。"""
     limit = max(1, config.team.max_active_workers)
     approvals = asyncio.Lock()
 
@@ -115,18 +61,49 @@ async def run_candidate_checks(
             decision = approval_callback(request)
             return await decision if isawaitable(decision) else decision
 
-    parallel_context = _CandidateContext(workspace, config, approve if approval_callback else None)
+    serial_approve = approval_callback
+    parallel_approve = approve if approval_callback else None
+
     for independent, batch in groupby(checks, key=lambda check: check.parallel_safe):
         pending = tuple(batch)
         if not independent or len(pending) < 2 or limit == 1:
-            for check in pending:
-                yield check, await context.run(check)
+            # 同一串行批次共享一个检查 worktree；每条检查间只在产生脏文件时清理，避免反复新建/删除 worktree。
+            with workspace.reusable_check_workspace() as (candidate, reset_if_dirty):
+                for idx, check in enumerate(pending):
+                    if idx > 0:
+                        await asyncio.to_thread(reset_if_dirty)
+                    result = await run_team_check(
+                        check,
+                        candidate,
+                        config=config,
+                        approval_callback=serial_approve,
+                        revision=workspace.candidate_revision,
+                        project_root=workspace.repository,
+                    )
+                    yield check, result
             continue
-        outcome = await _CHECK_GRAPH.ainvoke(
-            {"checks": pending}, {"max_concurrency": limit}, context=parallel_context
-        )
-        for check in pending:
-            yield check, outcome["results"][check.id]
+
+        semaphore = asyncio.Semaphore(limit)
+
+        async def _run_parallel(check: TeamCheck) -> tuple[TeamCheck, TeamCheckResult]:
+            async with semaphore:
+                cwd = await asyncio.to_thread(workspace.open_check_workspace)
+                try:
+                    result = await run_team_check(
+                        check,
+                        cwd,
+                        config=config,
+                        approval_callback=parallel_approve,
+                        revision=workspace.candidate_revision,
+                        project_root=workspace.repository,
+                    )
+                finally:
+                    await asyncio.to_thread(workspace.close_check_workspace, cwd)
+                return check, result
+
+        outcomes = await asyncio.gather(*(_run_parallel(check) for check in pending))
+        for check, result in outcomes:
+            yield check, result
 
 
 async def run_team_check(
@@ -136,10 +113,12 @@ async def run_team_check(
     config: PaiCliConfig,
     approval_callback=None,
     revision: str | None = None,
+    project_root: str | Path | None = None,
 ) -> TeamCheckResult:
     """Check one process result with fixed argv and a bounded, recorded observation."""
+    extra_roots = (project_root,) if project_root is not None else ()
     try:
-        argv = _checked_argv(check.argv, Path(cwd), config)
+        argv = _checked_argv(check.argv, Path(cwd), config, extra_roots=extra_roots)
         if config.policy.hitl_mode != "never":
             decision = (
                 approval_callback(
@@ -167,6 +146,7 @@ async def run_team_check(
         env = {
             key: value for key, value in os.environ.items() if key.upper() in _ENV_KEYS
         }
+        env = augment_env_for_venv(env, cwd, extra_roots=extra_roots)
         env.update(PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1")
         process = await asyncio.create_subprocess_exec(
             *argv,
@@ -255,7 +235,11 @@ async def run_team_check(
 
 
 def _checked_argv(
-    values: tuple[str, ...], cwd: Path, config: PaiCliConfig
+    values: tuple[str, ...],
+    cwd: Path,
+    config: PaiCliConfig,
+    *,
+    extra_roots: tuple[str | Path, ...] = (),
 ) -> tuple[str, ...]:
     if not values or any(
         not isinstance(value, str) or "\0" in value for value in values
@@ -267,13 +251,7 @@ def _checked_argv(
     if config.policy.command_guard_enabled:
         CommandGuard(config.policy.command_blacklist).validate(shlex.join(values))
     name = Path(program).name.lower()
-    contains_directory = "/" in program or "\\" in program
-    lookup = str(cwd / program) if contains_directory else program
-    executable = (
-        sys.executable
-        if program.lower() in {"python", "python3"}
-        else shutil.which(lookup)
-    )
+    executable = resolve_project_executable(program, cwd, extra_roots=extra_roots)
     if not executable:
         raise ValueError(f"executable not found: {program}")
     if (
