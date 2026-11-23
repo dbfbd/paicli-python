@@ -28,7 +28,7 @@ from paicli.runtime.api import runtime_api_key
 
 app = typer.Typer(
     name="paicli",
-    help="PaiCLI — Terminal AI Agent in Python (Claude Code alternative)",
+    help="PaiCLI — Terminal Coding Agent in Python",
     invoke_without_command=True,
     no_args_is_help=False,
 )
